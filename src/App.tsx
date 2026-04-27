@@ -166,80 +166,40 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings' | 'admin'>('chat');
   // Auth & Data Sync
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (u) => {
+    const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
-      
-      // If we determined auth state (logged in or not), we can stop blocking the UI
-      // Background sync will continue for profile data
-      if (u) {
-        // Sync User Data in background
-        const userRef = doc(db, 'users', u.uid);
-        getDoc(userRef).then(async (userSnap) => {
-          if (!userSnap.exists()) {
-            const newUser = {
-              uid: u.uid,
-              email: u.email,
-              displayName: u.displayName,
-              photoURL: u.photoURL,
-              role: u.email === 'sajidmahamud043@gmail.com' ? 'admin' : 'user',
-              settings: settingsRef.current,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp()
-            };
-            await setDoc(userRef, newUser).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${u.uid}`));
-            setUserData(newUser);
-            setIsAdmin(newUser.role === 'admin');
-          } else {
-            const data = userSnap.data();
-            setUserData(data);
-            setIsAdmin(data.role === 'admin');
-            if (data.settings) {
-              setSettings(data.settings);
-            }
-          }
-          setLoading(false);
-        }).catch(() => setLoading(false));
-
-        // Sync Tasks (Stream)
-        const tasksRef = collection(db, 'users', u.uid, 'tasks');
-        const qTasks = query(tasksRef, orderBy('time', 'desc'), limit(50));
-        const unsubTasks = onSnapshot(qTasks, (snapshot) => {
-          const t: any[] = [];
-          snapshot.forEach(doc => t.push({ id: doc.id, ...doc.data() }));
-          setTasks(t);
-        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${u.uid}/tasks`));
-
-        // Sync Neural Memories (Messages History)
-        const messagesRef = collection(db, 'users', u.uid, 'messages');
-        const qMessages = query(messagesRef, orderBy('timestamp', 'asc'), limit(50));
-        const unsubMessages = onSnapshot(qMessages, (snapshot) => {
-          const m: any[] = [];
-          snapshot.forEach(doc => {
-            const data = doc.data();
-            m.push({ role: data.role, text: data.text });
-          });
-          if (m.length > 0) {
-            setHistory(m);
-          }
-        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${u.uid}/messages`));
-
-        return () => {
-          unsubTasks();
-          unsubMessages();
-        };
-      } else {
-        setUserData(null);
-        setIsAdmin(false);
-        setLoading(false);
-      }
+      setLoading(false);
     });
     return () => unsub();
   }, []);
 
+  // Use LocalStorage for Persistence since Firestore is removed
   useEffect(() => {
-    if (user && userData && !sessionGreeted) {
-      const userName = userData.displayName ? userData.displayName.split(' ')[0] : (user.displayName ? user.displayName.split(' ')[0] : 'User');
-      const msg = `Hello ${userName} how are you ? Im always here to help you !!`;
+    if (user) {
+      const savedTasks = localStorage.getItem(`aura_tasks_${user.uid}`);
+      if (savedTasks) setTasks(JSON.parse(savedTasks));
+      
+      const savedHistory = localStorage.getItem(`aura_history_${user.uid}`);
+      if (savedHistory) setHistory(JSON.parse(savedHistory));
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (user) {
+      localStorage.setItem(`aura_tasks_${user.uid}`, JSON.stringify(tasks));
+    }
+  }, [tasks, user]);
+
+  useEffect(() => {
+    if (user) {
+      localStorage.setItem(`aura_history_${user.uid}`, JSON.stringify(history));
+    }
+  }, [history, user]);
+
+  useEffect(() => {
+    if (user && !sessionGreeted) {
+      const userName = user.displayName ? user.displayName.split(' ')[0] : 'User';
+      const msg = `Hello ${userName}, how are you? I'm always here to help you!!`;
       
       setHistory(prev => {
         if (prev.length > 0 && prev[prev.length-1].text === msg) return prev;
@@ -248,7 +208,7 @@ export default function App() {
       speak(msg);
       setSessionGreeted(true);
     }
-  }, [user, userData, sessionGreeted]);
+  }, [user, sessionGreeted]);
 
   const handleLogin = async () => {
     const provider = new GoogleAuthProvider();
@@ -270,16 +230,25 @@ export default function App() {
     }
   };
   const [wakeDetected, setWakeDetected] = useState(false);
-  const [systemConfig, setSystemConfig] = useState<any>(null);
+  const [systemConfig, setSystemConfig] = useState<any>({
+    features: {
+      aiChat: true,
+      voiceCommands: true,
+      realtimeSync: false
+    },
+    maintenance: false
+  });
   const wakeTriggeredRef = useRef(false);
 
-  // Sync System Config
+  // Sync System Config - Disabled to avoid permission errors (only using Google Auth now)
+  /*
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'system', 'config'), (snap) => {
       if (snap.exists()) setSystemConfig(snap.data());
     }, (err) => handleFirestoreError(err, OperationType.GET, 'system/config'));
     return () => unsub();
   }, []);
+  */
   
   const [isCameraActive, setIsCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -400,15 +369,7 @@ export default function App() {
   useEffect(() => {
     settingsRef.current = settings;
     localStorage.setItem('aura_settings', JSON.stringify(settings));
-    
-    // Sync settings to Firestore if logged in
-    if (user) {
-      updateDoc(doc(db, 'users', user.uid), { 
-        settings: settings,
-        updatedAt: serverTimestamp()
-      }).catch(e => console.warn("Settings sync failed:", e));
-    }
-  }, [settings, user]);
+  }, [settings]);
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
@@ -663,259 +624,41 @@ export default function App() {
     if (!user) return;
     
     setIsProcessing(true);
-    const messagesRef = collection(db, 'users', user.uid, 'messages');
-    
-    // Handle Voice Settings Commands
-    const lowerCommand = command.toLowerCase();
-    if (lowerCommand.includes('set voice speed to') || lowerCommand.includes('change theme to') || lowerCommand.includes('increase voice pitch') || lowerCommand.includes('decrease voice pitch')) {
-      const newSettings = { ...settings };
-      let changed = false;
+    const lowerCommand = (command || '').toLowerCase();
 
-      if (lowerCommand.includes('voice speed')) {
-        const match = lowerCommand.match(/(\d+(\.\d+)?)/);
-        if (match) {
-          newSettings.voiceSpeed = parseFloat(match[0]);
-          changed = true;
-        }
-      } else if (lowerCommand.includes('voice pitch')) {
-        if (lowerCommand.includes('increase')) newSettings.voicePitch += 0.1;
-        else if (lowerCommand.includes('decrease')) newSettings.voicePitch -= 0.1;
-        changed = true;
-      } else if (lowerCommand.includes('theme to')) {
-        const themes = ['cyan', 'crimson', 'emerald', 'sunset', 'ocean', 'minimalist'];
-        const targetTheme = themes.find(t => lowerCommand.includes(t));
-        if (targetTheme) {
-          newSettings.theme = targetTheme;
-          // Set matching accent color
-          const accents: Record<string, string> = { cyan: '#06b6d4', crimson: '#ef4444', emerald: '#10b981', sunset: '#f59e0b', ocean: '#3b82f6', minimalist: '#27272a' };
-          newSettings.accentColor = accents[targetTheme];
-          changed = true;
-        }
-      }
-
-      if (changed) {
-        setSettings(newSettings);
-        const fbMsg = "Neural settings recalibrated.";
-        setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
-        speak(fbMsg);
-        setIsProcessing(false);
-        return;
-      }
-    }
-
-    // AI Avatar Generation Logic
-    if (lowerCommand.includes('generate') && (lowerCommand.includes('avatar') || lowerCommand.includes('profile picture'))) {
-      try {
-        const prompt = `A futuristic neural-link avatar icon, high-tech, cyberpunk aesthetic, matching the color palette: ${settings.theme === 'cyan' ? 'cyan and blue' : settings.theme === 'crimson' ? 'red and dark' : 'vibrant colors'}. minimalist digital art.`;
-        const res = await getAssistantResponse(`[GENERATE_IMAGE: ${prompt}]`, [], undefined);
-        const imageUrl = res.match(/https:\/\/.*?\.(png|jpg|jpeg|webp)/)?.[0];
-        
-        if (imageUrl) {
-          setUserData({ ...userData, photoURL: imageUrl });
-          if (user) {
-            updateDoc(doc(db, 'users', user.uid), { photoURL: imageUrl })
-              .catch(e => handleFirestoreError(e, OperationType.UPDATE, `users/${user.uid}`));
-          }
-          const fbMsg = "Neural representation synthesized.";
-          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
-          speak(fbMsg);
-          setIsProcessing(false);
-          return;
-        }
-      } catch (err) {
-        handleFirestoreError(err, OperationType.GET, 'image-generation');
-      }
-    }
-
-    // Advanced Admin Commands
-    if (isAdmin) {
-      if (lowerCommand.includes('list users with role')) {
-        const role = lowerCommand.includes('admin') ? 'admin' : 'user';
-        const usersSnap = await getDocs(collection(db, 'users'))
-          .catch(e => handleFirestoreError(e, OperationType.LIST, 'users'));
-        if (usersSnap) {
-          const admins = usersSnap.docs
-            .filter(d => d.data().role === role)
-            .map(d => d.data().email || d.id);
-          const fbMsg = `NODE CLUSTER ${role.toUpperCase()}S: ${admins.join(', ')}`;
-          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
-          speak(fbMsg);
-          setIsProcessing(false);
-          return;
-        }
-      } else if (lowerCommand.includes('get user tasks')) {
-        const userId = command.split(' ').pop();
-        if (userId) {
-          const tasksSnap = await getDocs(collection(db, 'users', userId, 'tasks'))
-            .catch(e => handleFirestoreError(e, OperationType.LIST, `users/${userId}/tasks`));
-          if (tasksSnap) {
-            const userTasks = tasksSnap.docs.map(d => d.data().value);
-            const fbMsg = tasksSnap.empty ? "No active uplinks for this node." : `NODE ${userId} UPLINKS: ${userTasks.join(' | ')}`;
-            setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
-            speak(fbMsg);
-            setIsProcessing(false);
-            return;
-          }
-        }
-      } else if (lowerCommand.includes('delete user')) {
-        const userId = command.split(' ').pop();
-        if (userId && window.confirm(`Initiate purging of node ${userId}?`)) {
-          await deleteDoc(doc(db, 'users', userId))
-            .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${userId}`));
-          const fbMsg = `Node ${userId} purged from nexus.`;
-          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
-          speak(fbMsg);
-          setIsProcessing(false);
-          return;
-        }
-      }
-    }
-
-    // Save User Query
-    await addDoc(messagesRef, {
-      role: 'user',
-      text: command || '[Image Uploaded]',
-      image: imageBase64 || null,
-      timestamp: serverTimestamp()
-    }).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/messages`));
+    setHistory(prev => [...prev, { role: 'user', text: command || '[Image Uploaded]', image: imageBase64 || null }]);
     
     try {
-      const geminiHistory = history.map(h => {
-        const parts: any[] = [{ text: h.text }];
-        if (h.image) {
-          const mimeType = h.image.substring(h.image.indexOf(":") + 1, h.image.indexOf(";"));
-          const base64Data = h.image.substring(h.image.indexOf(",") + 1);
-          parts.push({
-            inlineData: {
-              mimeType,
-              data: base64Data
-            }
-          });
-        }
-        return { role: h.role, parts };
-      });
-      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64)
-        .catch(err => {
-          handleFirestoreError(err, OperationType.GET, 'gemini-service');
-          throw err;
-        });
+      const geminiHistory = history.map(h => ({
+        role: h.role,
+        parts: [{ text: h.text }]
+      }));
+
+      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64);
       
-      // Save AI Response
       let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').trim();
-      await addDoc(messagesRef, {
-        role: 'model',
-        text: cleanResponse,
-        timestamp: serverTimestamp()
-      }).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/messages`));
-
-      try {
-        let jsonStr = '';
-        let parsed = null;
-
-        const jsonMatch = response.match(/```json([\s\S]*?)```/);
-        const rawArrayMatch = response.match(/\[\s*\{\s*"action"[\s\S]*\}\s*\]/);
-
-        if (jsonMatch) {
-          jsonStr = jsonMatch[1].trim();
-          parsed = JSON.parse(jsonStr);
-          cleanResponse = response.replace(/```json([\s\S]*?)```/, '').trim();
-        } else if (response.trim().startsWith('[') && response.trim().endsWith(']')) {
-          jsonStr = response.trim();
-          parsed = JSON.parse(jsonStr);
-          cleanResponse = "Action sequence initiated.";
-        } else if (rawArrayMatch) {
-          jsonStr = rawArrayMatch[0].trim();
-          parsed = JSON.parse(jsonStr);
-          cleanResponse = response.replace(rawArrayMatch[0], '').trim();
-        }
-
-        if (parsed) {
-          const actions = Array.isArray(parsed) ? parsed : [parsed];
-          
-          // Start live execution sequence
-          setExecutingActions(actions);
-          setCurrentExecIndex(0);
-
-          actions.forEach(async (action) => {
-            const taskId = Math.random().toString(36).substr(2, 9);
-            const newTask = {
-              id: taskId,
-              userId: user?.uid,
-              type: action.action,
-              value: action.app_name || action.element || action.text || action.direction || action.target || (action.seconds ? `${action.seconds}s` : ''),
-              time: Date.now(),
-              remaining: undefined,
-              createdAt: serverTimestamp()
-            };
-            
-            if (user) {
-              await setDoc(doc(db, 'users', user.uid, 'tasks', taskId), newTask).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/tasks/${taskId}`));
-            }
-
-            if (action.action === 'OPEN_APP') {
-              console.log("Opening app:", action.app_name || action.target);
-            } else if (action.action === 'CALL') {
-              window.location.href = `tel:${action.target}`;
-            } else if (action.action === 'SEND_MESSAGE') {
-              window.location.href = `sms:?body=${encodeURIComponent(action.text || '')}`;
-            }
-          });
-        }
-      } catch (e) {
-        console.warn("JSON parsing failed, falling back", e);
-      }
-      
-      // If no natural text was left after removing JSON, provide a default friendly message
-      if (!cleanResponse) {
-        cleanResponse = "Action executed.";
-      }
+      setHistory(prev => [...prev, { role: 'model', text: cleanResponse }]);
+      speak(cleanResponse);
 
       const actionMatch = response.match(/\[ACTION:(.*?)\|(.*?)\]/);
       if (actionMatch) {
-        const [, type, value] = actionMatch;
-        
-        let remaining: number | undefined;
-        if (type === 'SET_TIMER') {
-          const minutesMatch = value.match(/(\d+)\s*(minute|মিনিট)/);
-          const secondsMatch = value.match(/(\d+)\s*(second|সেকেন্ড)/);
-          remaining = (parseInt(minutesMatch?.[1] || '0') * 60) + parseInt(secondsMatch?.[1] || '0');
-          if (remaining === 0) remaining = 60;
-        }
-
-        const taskId = Math.random().toString(36).substr(2, 9);
-        const newTask = {
-          id: taskId,
-          userId: user?.uid,
-          type: type,
-          value: value,
-          time: Date.now(),
-          remaining: remaining,
-          createdAt: serverTimestamp()
-        };
-        
-        if (user) {
-          setDoc(doc(db, 'users', user.uid, 'tasks', taskId), newTask).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/tasks/${taskId}`));
-        }
-
-        if (type === 'SEARCH') {
-          window.open(`https://www.google.com/search?q=${encodeURIComponent(value)}`, '_blank');
-        } else if (type === 'CALL') {
-          window.location.href = `tel:${value}`;
-        } else if (type === 'SEND_MESSAGE') {
-          window.location.href = `sms:?body=${encodeURIComponent(value)}`;
-        }
+         const [, type, value] = actionMatch;
+         const taskId = Math.random().toString(36).substr(2, 9);
+         const newTask = {
+           id: taskId,
+           userId: user.uid,
+           type: type,
+           value: value,
+           time: Date.now(),
+           createdAt: new Date().toISOString()
+         };
+         setTasks(prev => [newTask, ...prev]);
       }
-
-      setHistory(prev => [...prev, { role: 'model', text: cleanResponse || 'Action executed.' }]);
+    } catch (err) {
+      console.error("AI Error:", err);
+      setError("Neutral link interrupted.");
+    } finally {
       setIsProcessing(false);
-      
-      if (cleanResponse) {
-        speak(cleanResponse);
-      }
-    } catch (err: any) {
-      setError(err?.message || 'Connection interrupted. Please check your network.');
-      setIsProcessing(false);
-      console.error(err);
     }
   };
 
