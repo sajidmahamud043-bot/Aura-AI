@@ -5,51 +5,10 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X, LogIn, LogOut, ShieldAlert, Zap, Search } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X, ShieldAlert, Zap, Search } from 'lucide-react';
 import { getAssistantResponse } from './services/geminiService';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
-import AdminPanel from './components/AdminPanel';
-import { auth, db } from './lib/firebase';
-import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut, User } from 'firebase/auth';
-import { doc, getDoc, setDoc, onSnapshot, updateDoc, collection, query, orderBy, limit, deleteDoc, serverTimestamp, getDocs, addDoc } from 'firebase/firestore';
-
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId?: string | null;
-    email?: string | null;
-    emailVerified?: boolean | null;
-    isAnonymous?: boolean | null;
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-    },
-    operationType,
-    path
-  }
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(errInfo.error);
-}
 
 // Types for Speech Recognition
 interface SpeechRecognitionEvent extends Event {
@@ -137,10 +96,7 @@ function checkWakeWord(transcript: string, sensitivity: number): { detected: boo
 }
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [userData, setUserData] = useState<any>(null);
-  const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [sessionGreeted, setSessionGreeted] = useState(false);
@@ -163,42 +119,28 @@ export default function App() {
   }, [error]);
 
   const [deviceStats, setDeviceStats] = useState({ battery: 100, online: navigator.onLine, location: 'Scanning...', networkType: 'WiFi', networkSpeed: 'Fast' });
-  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings' | 'admin'>('chat');
-  // Auth & Data Sync
+  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings'>('chat');
+
+  // Use LocalStorage for Persistence
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setLoading(false);
-    });
-    return () => unsub();
+    const savedTasks = localStorage.getItem(`aura_tasks_local`);
+    if (savedTasks) setTasks(JSON.parse(savedTasks));
+    
+    const savedHistory = localStorage.getItem(`aura_history_local`);
+    if (savedHistory) setHistory(JSON.parse(savedHistory));
   }, []);
 
-  // Use LocalStorage for Persistence since Firestore is removed
   useEffect(() => {
-    if (user) {
-      const savedTasks = localStorage.getItem(`aura_tasks_${user.uid}`);
-      if (savedTasks) setTasks(JSON.parse(savedTasks));
-      
-      const savedHistory = localStorage.getItem(`aura_history_${user.uid}`);
-      if (savedHistory) setHistory(JSON.parse(savedHistory));
-    }
-  }, [user]);
+    localStorage.setItem(`aura_tasks_local`, JSON.stringify(tasks));
+  }, [tasks]);
 
   useEffect(() => {
-    if (user) {
-      localStorage.setItem(`aura_tasks_${user.uid}`, JSON.stringify(tasks));
-    }
-  }, [tasks, user]);
+    localStorage.setItem(`aura_history_local`, JSON.stringify(history));
+  }, [history]);
 
   useEffect(() => {
-    if (user) {
-      localStorage.setItem(`aura_history_${user.uid}`, JSON.stringify(history));
-    }
-  }, [history, user]);
-
-  useEffect(() => {
-    if (user && !sessionGreeted) {
-      const userName = user.displayName ? user.displayName.split(' ')[0] : 'User';
+    if (!sessionGreeted) {
+      const userName = settings.userName || 'User';
       const msg = `Hello ${userName}, how are you? I'm always here to help you!!`;
       
       setHistory(prev => {
@@ -208,27 +150,8 @@ export default function App() {
       speak(msg);
       setSessionGreeted(true);
     }
-  }, [user, sessionGreeted]);
+  }, [sessionGreeted]);
 
-  const handleLogin = async () => {
-    const provider = new GoogleAuthProvider();
-    try {
-      await signInWithPopup(auth, provider);
-    } catch (err) {
-      setError("Login failed. Please check your connection.");
-    }
-  };
-
-  const handleLogout = async () => {
-    try {
-      await signOut(auth);
-      setHistory([]);
-      setTasks([]);
-      setActiveTab('chat');
-    } catch (err) {
-      setError("Logout failed.");
-    }
-  };
   const [wakeDetected, setWakeDetected] = useState(false);
   const [systemConfig, setSystemConfig] = useState<any>({
     features: {
@@ -621,7 +544,6 @@ export default function App() {
 
   const handleUserCommand = async (command: string, imageBase64?: string) => {
     if (!command.trim() && !imageBase64) return;
-    if (!user) return;
     
     setIsProcessing(true);
     const lowerCommand = (command || '').toLowerCase();
@@ -643,16 +565,15 @@ export default function App() {
       const actionMatch = response.match(/\[ACTION:(.*?)\|(.*?)\]/);
       if (actionMatch) {
          const [, type, value] = actionMatch;
-         const taskId = Math.random().toString(36).substr(2, 9);
-         const newTask = {
-           id: taskId,
-           userId: user.uid,
-           type: type,
-           value: value,
-           time: Date.now(),
-           createdAt: new Date().toISOString()
-         };
-         setTasks(prev => [newTask, ...prev]);
+          const taskId = Math.random().toString(36).substr(2, 9);
+          const newTask = {
+            id: taskId,
+            type: type,
+            value: value,
+            time: Date.now(),
+            createdAt: new Date().toISOString()
+          };
+          setTasks(prev => [newTask, ...prev]);
       }
     } catch (err) {
       console.error("AI Error:", err);
@@ -847,42 +768,7 @@ export default function App() {
         )}
       </AnimatePresence>
       <AnimatePresence>
-        {!user && !loading ? (
-          <motion.div 
-            key="login"
-            initial={{ opacity: 0, scale: 0.95 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 1.05 }}
-            className="fixed inset-0 z-[150] flex flex-col items-center justify-center p-6 text-center"
-          >
-            <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-40">
-              <div className="absolute -top-[20%] -left-[20%] w-[60%] h-[60%] rounded-full blur-[150px] bg-cyan-500/20" />
-              <div className="absolute -bottom-[20%] -right-[20%] w-[60%] h-[60%] rounded-full blur-[150px] bg-purple-500/20" />
-            </div>
-            
-            <div className="relative mb-12">
-               <div className="w-24 h-24 rounded-full border-2 border-white/10 flex items-center justify-center p-4 bg-white/5 backdrop-blur-3xl shadow-[0_0_50px_rgba(255,255,255,0.05)]">
-                  <Globe className="w-full h-full text-cyan-400 animate-pulse" />
-               </div>
-               <div className="absolute -inset-4 border border-white/5 rounded-full animate-[spin_10s_linear_infinite]" />
-            </div>
-
-            <h1 className="text-4xl font-light tracking-tighter mb-4">
-              Aura <span className="opacity-20 font-black italic">PRO</span>
-            </h1>
-            <p className="text-[10px] uppercase tracking-[0.4em] font-black opacity-30 mb-12">Universal Intelligence Interface</p>
-            
-            <button 
-              onClick={handleLogin}
-              className="group relative px-8 py-4 bg-white text-black rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 hover:shadow-[0_0_30px_rgba(255,255,255,0.3)]"
-            >
-              <LogIn className="w-5 h-5" />
-              Sign in with Neural ID
-              <div className="absolute inset-0 rounded-2xl border border-white group-hover:scale-110 opacity-0 group-hover:opacity-100 transition-all" />
-            </button>
-            <p className="mt-8 text-[10px] opacity-20 uppercase tracking-widest font-bold">Encrypted via Nexus Protocol</p>
-          </motion.div>
-        ) : loading ? (
+        {loading ? (
           <motion.div 
             key="loading"
             initial={{ opacity: 0 }}
@@ -1163,15 +1049,8 @@ export default function App() {
                     </button>
                     <h2 className="text-xs uppercase tracking-widest font-black opacity-40">Active Nodes</h2>
                   </div>
-                  <button onClick={async () => {
-                    if (user) {
-                      const snapshot = await getDocs(collection(db, 'users', user.uid, 'tasks'))
-                        .catch(e => handleFirestoreError(e, OperationType.LIST, `users/${user.uid}/tasks`));
-                      if (snapshot) {
-                        snapshot.forEach(async d => await deleteDoc(doc(db, 'users', user.uid, 'tasks', d.id))
-                          .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${d.id}`)));
-                      }
-                    }
+                  <button onClick={() => {
+                    setTasks([]);
                   }} className="text-[10px] opacity-40 hover:opacity-100 hover:text-red-400 flex items-center gap-1 transition-colors">
                     <Trash2 className="w-3 h-3" /> Clear Nodes
                   </button>
@@ -1179,20 +1058,18 @@ export default function App() {
 
                 {/* Quick Add Node */}
                 <form 
-                  onSubmit={async (e) => {
+                  onSubmit={(e) => {
                     e.preventDefault();
                     const input = (e.currentTarget.elements.namedItem('nodeValue') as HTMLInputElement);
-                    if (input.value.trim() && user) {
+                    if (input.value.trim()) {
                       const taskData = { 
                         id: crypto.randomUUID(),
                         type: 'MANUAL_ENTRY', 
                         value: input.value.trim(), 
                         time: 0, 
-                        userId: user.uid, 
-                        createdAt: serverTimestamp() 
+                        createdAt: new Date().toISOString()
                       };
-                      await addDoc(collection(db, 'users', user.uid, 'tasks'), taskData)
-                        .catch(err => handleFirestoreError(err, OperationType.CREATE, `users/${user.uid}/tasks`));
+                      setTasks(prev => [taskData, ...prev]);
                       input.value = '';
                     }
                   }}
@@ -1255,21 +1132,18 @@ export default function App() {
                             <p className="text-[10px] opacity-40 truncate">{task.value}</p>
                           </div>
                           <button 
-                            onClick={async () => {
+                            onClick={() => {
                               playCompleteSound();
-                              if (user) {
-                                setCompletingTasks(prev => new Set([...prev, task.id]));
-                                // Delay deletion for animation
-                                setTimeout(async () => {
-                                  await deleteDoc(doc(db, 'users', user.uid, 'tasks', task.id))
-                                    .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${task.id}`));
-                                  setCompletingTasks(prev => {
-                                    const next = new Set(prev);
-                                    next.delete(task.id);
-                                    return next;
-                                  });
-                                }, 600);
-                              }
+                              setCompletingTasks(prev => new Set([...prev, task.id]));
+                              // Delay deletion for animation
+                              setTimeout(() => {
+                                setTasks(prev => prev.filter(t => t.id !== task.id));
+                                setCompletingTasks(prev => {
+                                  const next = new Set(prev);
+                                  next.delete(task.id);
+                                  return next;
+                                });
+                              }, 600);
                             }}
                             className="opacity-0 group-hover:opacity-100 p-2 text-white/30 hover:text-green-500 transition-all relative"
                             title="Complete Task"
@@ -1289,11 +1163,8 @@ export default function App() {
                             <Check className={cn("w-4 h-4 transition-all", completingTasks.has(task.id) && "scale-150 text-green-500")} />
                           </button>
                           <button 
-                            onClick={async () => {
-                              if (user) {
-                                await deleteDoc(doc(db, 'users', user.uid, 'tasks', task.id))
-                                  .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${task.id}`));
-                              }
+                            onClick={() => {
+                              setTasks(prev => prev.filter(t => t.id !== task.id));
                             }}
                             className="opacity-0 group-hover:opacity-100 p-2 text-white/30 hover:text-red-500 transition-all"
                             title="Delete Task"
@@ -1308,15 +1179,6 @@ export default function App() {
               </motion.div>
             )}
 
-            {activeTab === 'admin' && isAdmin && (
-              <AdminPanel 
-                 onClose={() => setActiveTab('settings')} 
-                 activeColor={activeColor}
-                 activeText={activeText}
-                 activeBorder={activeBorder}
-              />
-            )}
-
             {activeTab === 'settings' && (
               <motion.div 
                 key="settings"
@@ -1329,14 +1191,6 @@ export default function App() {
                 <div className="flex justify-between items-center">
                   <h2 className={cn("text-xs uppercase tracking-[0.3em] font-black", activeText)}>System Core</h2>
                   <div className="flex gap-2">
-                    {isAdmin && (
-                      <button 
-                        onClick={() => setActiveTab('admin')}
-                        className="px-3 py-2 rounded-xl bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-black tracking-widest uppercase hover:bg-cyan-500/30 transition-all flex items-center gap-1"
-                      >
-                        <ShieldAlert className="w-3 h-3" /> Admin
-                      </button>
-                    )}
                     <button onClick={() => setActiveTab('chat')} className="text-[10px] opacity-40 hover:opacity-100 flex items-center gap-1 transition-all">
                       Exit Core
                     </button>
@@ -1626,13 +1480,6 @@ export default function App() {
                       className="w-full mt-4 py-5 rounded-2xl bg-red-500/20 border border-red-500/30 text-red-500 text-xs uppercase tracking-[0.2em] font-black hover:bg-red-500/30 transition-all active:scale-95 flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
                     >
                       <Trash2 className="w-4 h-4" /> Clear Chat History
-                    </button>
-
-                    <button 
-                      onClick={handleLogout}
-                      className="w-full py-5 rounded-2xl bg-white/5 border border-white/10 text-white/40 text-xs uppercase tracking-[0.2em] font-black hover:bg-white/10 transition-all active:scale-95 flex items-center justify-center gap-2"
-                    >
-                      <LogOut className="w-4 h-4" /> Logout from Nexus
                     </button>
                   </div>
                 </div>
