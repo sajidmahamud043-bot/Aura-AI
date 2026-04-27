@@ -5,10 +5,51 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X, LogIn, LogOut, ShieldAlert, Zap, Search } from 'lucide-react';
 import { getAssistantResponse } from './services/geminiService';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
+import AdminPanel from './components/AdminPanel';
+import { auth, db } from './lib/firebase';
+import { signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut, User } from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot, updateDoc, collection, query, orderBy, limit, deleteDoc, serverTimestamp, getDocs, addDoc } from 'firebase/firestore';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(errInfo.error);
+}
 
 // Types for Speech Recognition
 interface SpeechRecognitionEvent extends Event {
@@ -96,17 +137,149 @@ function checkWakeWord(transcript: string, sensitivity: number): { detected: boo
 }
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [userData, setUserData] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [sessionGreeted, setSessionGreeted] = useState(false);
+  const [completingTasks, setCompletingTasks] = useState<Set<string>>(new Set());
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcript, setTranscript] = useState('');
   const [history, setHistory] = useState<{ role: 'user' | 'model', text: string, image?: string }[]>([]);
-  const [tasks, setTasks] = useState<{ id: string; type: string; value: string; time: number; remaining?: number }[]>([]);
+  const [tasks, setTasks] = useState<{ id: string; type: string; value: string; time: number; remaining?: number; dueAt?: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isUserTyping, setIsUserTyping] = useState(false);
+  const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const clearError = () => setError(null);
+
+  useEffect(() => {
+    if (error) {
+      const timer = setTimeout(() => setError(null), 6000);
+      return () => clearTimeout(timer);
+    }
+  }, [error]);
+
   const [deviceStats, setDeviceStats] = useState({ battery: 100, online: navigator.onLine, location: 'Scanning...', networkType: 'WiFi', networkSpeed: 'Fast' });
-  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings' | 'admin'>('chat');
+  // Auth & Data Sync
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      setUser(u);
+      
+      // If we determined auth state (logged in or not), we can stop blocking the UI
+      // Background sync will continue for profile data
+      if (u) {
+        // Sync User Data in background
+        const userRef = doc(db, 'users', u.uid);
+        getDoc(userRef).then(async (userSnap) => {
+          if (!userSnap.exists()) {
+            const newUser = {
+              uid: u.uid,
+              email: u.email,
+              displayName: u.displayName,
+              photoURL: u.photoURL,
+              role: u.email === 'sajidmahamud043@gmail.com' ? 'admin' : 'user',
+              settings: settingsRef.current,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            };
+            await setDoc(userRef, newUser).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${u.uid}`));
+            setUserData(newUser);
+            setIsAdmin(newUser.role === 'admin');
+          } else {
+            const data = userSnap.data();
+            setUserData(data);
+            setIsAdmin(data.role === 'admin');
+            if (data.settings) {
+              setSettings(data.settings);
+            }
+          }
+          setLoading(false);
+        }).catch(() => setLoading(false));
+
+        // Sync Tasks (Stream)
+        const tasksRef = collection(db, 'users', u.uid, 'tasks');
+        const qTasks = query(tasksRef, orderBy('time', 'desc'), limit(50));
+        const unsubTasks = onSnapshot(qTasks, (snapshot) => {
+          const t: any[] = [];
+          snapshot.forEach(doc => t.push({ id: doc.id, ...doc.data() }));
+          setTasks(t);
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${u.uid}/tasks`));
+
+        // Sync Neural Memories (Messages History)
+        const messagesRef = collection(db, 'users', u.uid, 'messages');
+        const qMessages = query(messagesRef, orderBy('timestamp', 'asc'), limit(50));
+        const unsubMessages = onSnapshot(qMessages, (snapshot) => {
+          const m: any[] = [];
+          snapshot.forEach(doc => {
+            const data = doc.data();
+            m.push({ role: data.role, text: data.text });
+          });
+          if (m.length > 0) {
+            setHistory(m);
+          }
+        }, (err) => handleFirestoreError(err, OperationType.LIST, `users/${u.uid}/messages`));
+
+        return () => {
+          unsubTasks();
+          unsubMessages();
+        };
+      } else {
+        setUserData(null);
+        setIsAdmin(false);
+        setLoading(false);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  useEffect(() => {
+    if (user && userData && !sessionGreeted) {
+      const userName = userData.displayName ? userData.displayName.split(' ')[0] : (user.displayName ? user.displayName.split(' ')[0] : 'User');
+      const msg = `Hello ${userName} how are you ? Im always here to help you !!`;
+      
+      setHistory(prev => {
+        if (prev.length > 0 && prev[prev.length-1].text === msg) return prev;
+        return [...prev, { role: 'model', text: msg }];
+      });
+      speak(msg);
+      setSessionGreeted(true);
+    }
+  }, [user, userData, sessionGreeted]);
+
+  const handleLogin = async () => {
+    const provider = new GoogleAuthProvider();
+    try {
+      await signInWithPopup(auth, provider);
+    } catch (err) {
+      setError("Login failed. Please check your connection.");
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      setHistory([]);
+      setTasks([]);
+      setActiveTab('chat');
+    } catch (err) {
+      setError("Logout failed.");
+    }
+  };
   const [wakeDetected, setWakeDetected] = useState(false);
+  const [systemConfig, setSystemConfig] = useState<any>(null);
   const wakeTriggeredRef = useRef(false);
+
+  // Sync System Config
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, 'system', 'config'), (snap) => {
+      if (snap.exists()) setSystemConfig(snap.data());
+    });
+    return () => unsub();
+  }, []);
   
   const [isCameraActive, setIsCameraActive] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -201,6 +374,7 @@ export default function App() {
 
   const [showInput, setShowInput] = useState(false);
   const [inputText, setInputText] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
 
   // Settings with Persistence
   const [settings, setSettings] = useState(() => {
@@ -212,6 +386,7 @@ export default function App() {
       voiceSpeed: 1.05,
       voicePitch: 1.1,
       theme: 'cyan',
+      accentColor: '#06b6d4',
       autoListen: false,
       autoListenSensitivity: 3, // 1 to 5
       hapticFeedback: true,
@@ -225,7 +400,15 @@ export default function App() {
   useEffect(() => {
     settingsRef.current = settings;
     localStorage.setItem('aura_settings', JSON.stringify(settings));
-  }, [settings]);
+    
+    // Sync settings to Firestore if logged in
+    if (user) {
+      updateDoc(doc(db, 'users', user.uid), { 
+        settings: settings,
+        updatedAt: serverTimestamp()
+      }).catch(e => console.warn("Settings sync failed:", e));
+    }
+  }, [settings, user]);
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
@@ -393,13 +576,46 @@ export default function App() {
   }, []);
 
   const startCamera = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setError("Your browser does not support camera access.");
+      return;
+    }
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      // Try with preferred constraints first
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { facingMode: 'user' } 
+        });
+      } catch (e) {
+        // Fallback to basic video if facingMode fails
+        console.warn("Retrying camera with basic constraints...");
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      }
+
       streamRef.current = stream;
       setIsCameraActive(true);
-    } catch (err) {
+      
+      // Delay assignment slightly to ensure video element is mounted in the DOM
+      setTimeout(() => {
+        if (videoRef.current && streamRef.current) {
+          videoRef.current.srcObject = streamRef.current;
+        }
+      }, 100);
+
+    } catch (err: any) {
       console.error("Camera access denied or unavailable", err);
-      setError("Unable to access the camera.");
+      let msg = "Unable to access the camera.";
+      if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError' || err.message?.includes('found')) {
+        msg = "No camera device detected. Please connect a camera and try again.";
+      } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        msg = "Camera permission was denied. Please allow access in your browser settings.";
+      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+        msg = "Camera is already in use by another application.";
+      }
+      setError(msg);
+      setIsCameraActive(false);
     }
   };
 
@@ -407,6 +623,10 @@ export default function App() {
     if (isCameraActive && videoRef.current && streamRef.current) {
       videoRef.current.srcObject = streamRef.current;
     }
+    // Cleanup if stream becomes null or component updates
+    return () => {
+      if (videoRef.current) videoRef.current.srcObject = null;
+    };
   }, [isCameraActive]);
 
   const stopCamera = useCallback(() => {
@@ -440,9 +660,124 @@ export default function App() {
 
   const handleUserCommand = async (command: string, imageBase64?: string) => {
     if (!command.trim() && !imageBase64) return;
+    if (!user) return;
     
     setIsProcessing(true);
-    setHistory(prev => [...prev, { role: 'user', text: command || '[Image Uploaded]', image: imageBase64 }]);
+    const messagesRef = collection(db, 'users', user.uid, 'messages');
+    
+    // Handle Voice Settings Commands
+    const lowerCommand = command.toLowerCase();
+    if (lowerCommand.includes('set voice speed to') || lowerCommand.includes('change theme to') || lowerCommand.includes('increase voice pitch') || lowerCommand.includes('decrease voice pitch')) {
+      const newSettings = { ...settings };
+      let changed = false;
+
+      if (lowerCommand.includes('voice speed')) {
+        const match = lowerCommand.match(/(\d+(\.\d+)?)/);
+        if (match) {
+          newSettings.voiceSpeed = parseFloat(match[0]);
+          changed = true;
+        }
+      } else if (lowerCommand.includes('voice pitch')) {
+        if (lowerCommand.includes('increase')) newSettings.voicePitch += 0.1;
+        else if (lowerCommand.includes('decrease')) newSettings.voicePitch -= 0.1;
+        changed = true;
+      } else if (lowerCommand.includes('theme to')) {
+        const themes = ['cyan', 'crimson', 'emerald', 'sunset', 'ocean', 'minimalist'];
+        const targetTheme = themes.find(t => lowerCommand.includes(t));
+        if (targetTheme) {
+          newSettings.theme = targetTheme;
+          // Set matching accent color
+          const accents: Record<string, string> = { cyan: '#06b6d4', crimson: '#ef4444', emerald: '#10b981', sunset: '#f59e0b', ocean: '#3b82f6', minimalist: '#27272a' };
+          newSettings.accentColor = accents[targetTheme];
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        setSettings(newSettings);
+        const fbMsg = "Neural settings recalibrated.";
+        setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
+        speak(fbMsg);
+        setIsProcessing(false);
+        return;
+      }
+    }
+
+    // AI Avatar Generation Logic
+    if (lowerCommand.includes('generate') && (lowerCommand.includes('avatar') || lowerCommand.includes('profile picture'))) {
+      try {
+        const prompt = `A futuristic neural-link avatar icon, high-tech, cyberpunk aesthetic, matching the color palette: ${settings.theme === 'cyan' ? 'cyan and blue' : settings.theme === 'crimson' ? 'red and dark' : 'vibrant colors'}. minimalist digital art.`;
+        const res = await getAssistantResponse(`[GENERATE_IMAGE: ${prompt}]`, [], undefined);
+        const imageUrl = res.match(/https:\/\/.*?\.(png|jpg|jpeg|webp)/)?.[0];
+        
+        if (imageUrl) {
+          setUserData({ ...userData, photoURL: imageUrl });
+          if (user) {
+            updateDoc(doc(db, 'users', user.uid), { photoURL: imageUrl })
+              .catch(e => handleFirestoreError(e, OperationType.UPDATE, `users/${user.uid}`));
+          }
+          const fbMsg = "Neural representation synthesized.";
+          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
+          speak(fbMsg);
+          setIsProcessing(false);
+          return;
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.GET, 'image-generation');
+      }
+    }
+
+    // Advanced Admin Commands
+    if (isAdmin) {
+      if (lowerCommand.includes('list users with role')) {
+        const role = lowerCommand.includes('admin') ? 'admin' : 'user';
+        const usersSnap = await getDocs(collection(db, 'users'))
+          .catch(e => handleFirestoreError(e, OperationType.LIST, 'users'));
+        if (usersSnap) {
+          const admins = usersSnap.docs
+            .filter(d => d.data().role === role)
+            .map(d => d.data().email || d.id);
+          const fbMsg = `NODE CLUSTER ${role.toUpperCase()}S: ${admins.join(', ')}`;
+          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
+          speak(fbMsg);
+          setIsProcessing(false);
+          return;
+        }
+      } else if (lowerCommand.includes('get user tasks')) {
+        const userId = command.split(' ').pop();
+        if (userId) {
+          const tasksSnap = await getDocs(collection(db, 'users', userId, 'tasks'))
+            .catch(e => handleFirestoreError(e, OperationType.LIST, `users/${userId}/tasks`));
+          if (tasksSnap) {
+            const userTasks = tasksSnap.docs.map(d => d.data().value);
+            const fbMsg = tasksSnap.empty ? "No active uplinks for this node." : `NODE ${userId} UPLINKS: ${userTasks.join(' | ')}`;
+            setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
+            speak(fbMsg);
+            setIsProcessing(false);
+            return;
+          }
+        }
+      } else if (lowerCommand.includes('delete user')) {
+        const userId = command.split(' ').pop();
+        if (userId && window.confirm(`Initiate purging of node ${userId}?`)) {
+          await deleteDoc(doc(db, 'users', userId))
+            .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${userId}`));
+          const fbMsg = `Node ${userId} purged from nexus.`;
+          setHistory(prev => [...prev, { role: 'model', text: fbMsg }]);
+          speak(fbMsg);
+          setIsProcessing(false);
+          return;
+        }
+      }
+    }
+
+    // Save User Query
+    await addDoc(messagesRef, {
+      role: 'user',
+      text: command || '[Image Uploaded]',
+      image: imageBase64 || null,
+      timestamp: serverTimestamp()
+    }).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/messages`));
     
     try {
       const geminiHistory = history.map(h => {
@@ -459,9 +794,19 @@ export default function App() {
         }
         return { role: h.role, parts };
       });
-      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64);
+      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64)
+        .catch(err => {
+          handleFirestoreError(err, OperationType.GET, 'gemini-service');
+          throw err;
+        });
       
+      // Save AI Response
       let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').trim();
+      await addDoc(messagesRef, {
+        role: 'model',
+        text: cleanResponse,
+        timestamp: serverTimestamp()
+      }).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/messages`));
 
       try {
         let jsonStr = '';
@@ -491,15 +836,21 @@ export default function App() {
           setExecutingActions(actions);
           setCurrentExecIndex(0);
 
-          actions.forEach(action => {
+          actions.forEach(async (action) => {
+            const taskId = Math.random().toString(36).substr(2, 9);
             const newTask = {
-              id: Math.random().toString(36).substr(2, 9),
+              id: taskId,
+              userId: user?.uid,
               type: action.action,
               value: action.app_name || action.element || action.text || action.direction || action.target || (action.seconds ? `${action.seconds}s` : ''),
               time: Date.now(),
-              remaining: undefined
+              remaining: undefined,
+              createdAt: serverTimestamp()
             };
-            setTasks(prev => [newTask, ...prev]);
+            
+            if (user) {
+              await setDoc(doc(db, 'users', user.uid, 'tasks', taskId), newTask).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/tasks/${taskId}`));
+            }
 
             if (action.action === 'OPEN_APP') {
               console.log("Opening app:", action.app_name || action.target);
@@ -531,14 +882,20 @@ export default function App() {
           if (remaining === 0) remaining = 60;
         }
 
+        const taskId = Math.random().toString(36).substr(2, 9);
         const newTask = {
-          id: Math.random().toString(36).substr(2, 9),
+          id: taskId,
+          userId: user?.uid,
           type: type,
           value: value,
           time: Date.now(),
-          remaining: remaining
+          remaining: remaining,
+          createdAt: serverTimestamp()
         };
-        setTasks(prev => [newTask, ...prev]);
+        
+        if (user) {
+          setDoc(doc(db, 'users', user.uid, 'tasks', taskId), newTask).catch(e => handleFirestoreError(e, OperationType.CREATE, `users/${user.uid}/tasks/${taskId}`));
+        }
 
         if (type === 'SEARCH') {
           window.open(`https://www.google.com/search?q=${encodeURIComponent(value)}`, '_blank');
@@ -555,8 +912,8 @@ export default function App() {
       if (cleanResponse) {
         speak(cleanResponse);
       }
-    } catch (err) {
-      setError('Connection interrupted.');
+    } catch (err: any) {
+      setError(err?.message || 'Connection interrupted. Please check your network.');
       setIsProcessing(false);
       console.error(err);
     }
@@ -710,6 +1067,97 @@ export default function App() {
       settings.theme === 'ocean' && "bg-[#040b16] bg-[radial-gradient(circle_at_bottom_left,_#1e3a8a_0%,_transparent_50%)]",
       settings.theme === 'minimalist' && "bg-[#09090b] bg-[radial-gradient(circle_at_center,_#27272a_0%,_transparent_100%)]"
     )}>
+      {/* Refined Error Notification */}
+      <AnimatePresence>
+        {error && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            className="fixed top-24 inset-x-6 z-[200] max-w-md mx-auto"
+          >
+            <div className="bg-red-500/20 border border-red-500/30 backdrop-blur-3xl rounded-2xl p-4 flex items-start gap-4 shadow-[0_20px_50px_rgba(0,0,0,0.5)]">
+               <div className="p-2 bg-red-500/20 rounded-xl text-red-500">
+                  <ShieldAlert className="w-5 h-5" />
+               </div>
+               <div className="flex-1 min-w-0 pt-1">
+                  <h3 className="text-[10px] font-black uppercase tracking-widest text-red-500 mb-1">Nexus System Error</h3>
+                  <p className="text-[11px] text-white/80 font-mono leading-relaxed">{error}</p>
+               </div>
+               <button 
+                onClick={clearError}
+                className="p-1 hover:bg-white/10 rounded-lg transition-colors"
+               >
+                  <X className="w-4 h-4 opacity-40 hover:opacity-100" />
+               </button>
+            </div>
+            <div className="h-1 bg-red-500/30 mt-1 rounded-full overflow-hidden">
+               <motion.div 
+                 initial={{ width: "100%" }}
+                 animate={{ width: "0%" }}
+                 transition={{ duration: 5, ease: "linear" }}
+                 onAnimationComplete={clearError}
+                 className="h-full bg-red-500" 
+               />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {!user && !loading ? (
+          <motion.div 
+            key="login"
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 1.05 }}
+            className="fixed inset-0 z-[150] flex flex-col items-center justify-center p-6 text-center"
+          >
+            <div className="absolute inset-0 overflow-hidden pointer-events-none opacity-40">
+              <div className="absolute -top-[20%] -left-[20%] w-[60%] h-[60%] rounded-full blur-[150px] bg-cyan-500/20" />
+              <div className="absolute -bottom-[20%] -right-[20%] w-[60%] h-[60%] rounded-full blur-[150px] bg-purple-500/20" />
+            </div>
+            
+            <div className="relative mb-12">
+               <div className="w-24 h-24 rounded-full border-2 border-white/10 flex items-center justify-center p-4 bg-white/5 backdrop-blur-3xl shadow-[0_0_50px_rgba(255,255,255,0.05)]">
+                  <Globe className="w-full h-full text-cyan-400 animate-pulse" />
+               </div>
+               <div className="absolute -inset-4 border border-white/5 rounded-full animate-[spin_10s_linear_infinite]" />
+            </div>
+
+            <h1 className="text-4xl font-light tracking-tighter mb-4">
+              Aura <span className="opacity-20 font-black italic">PRO</span>
+            </h1>
+            <p className="text-[10px] uppercase tracking-[0.4em] font-black opacity-30 mb-12">Universal Intelligence Interface</p>
+            
+            <button 
+              onClick={handleLogin}
+              className="group relative px-8 py-4 bg-white text-black rounded-2xl font-bold flex items-center gap-3 transition-all active:scale-95 hover:shadow-[0_0_30px_rgba(255,255,255,0.3)]"
+            >
+              <LogIn className="w-5 h-5" />
+              Sign in with Neural ID
+              <div className="absolute inset-0 rounded-2xl border border-white group-hover:scale-110 opacity-0 group-hover:opacity-100 transition-all" />
+            </button>
+            <p className="mt-8 text-[10px] opacity-20 uppercase tracking-widest font-bold">Encrypted via Nexus Protocol</p>
+          </motion.div>
+        ) : loading ? (
+          <motion.div 
+            key="loading"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[200] flex flex-col items-center justify-center space-y-4"
+          >
+            <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+            <div className="relative flex flex-col items-center space-y-4">
+              <div className={cn("w-12 h-12 rounded-full border-4 border-white/10 border-t-white animate-spin", activeBorder)} />
+              <div className="flex flex-col items-center gap-1">
+                <p className="text-[9px] uppercase tracking-[0.5em] font-black animate-pulse text-white/60">Establishing Neural Link</p>
+                <p className="text-[8px] font-mono opacity-30 uppercase">Nexus Protocol Handshake...</p>
+              </div>
+            </div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
       {/* Background Decor */}
       <div className="fixed inset-0 overflow-hidden pointer-events-none opacity-20">
         <div className={cn("absolute -top-[10%] -left-[10%] w-[50%] h-[50%] rounded-full blur-[120px]", activeColor)} />
@@ -725,11 +1173,16 @@ export default function App() {
             <span>{deviceStats.networkType}</span>
             <span>({deviceStats.networkSpeed})</span>
           </div>
-          <Wifi className={cn("w-3 h-3", !deviceStats.online && "text-red-500")} />
+          <Wifi className={cn("w-3 h-3 transition-colors duration-500", !deviceStats.online ? "text-red-500 animate-pulse" : "text-green-400")} />
         </div>
         <div className="flex gap-2 items-center">
           <span className="opacity-50">{deviceStats.location}</span>
-          <Battery className="w-3 h-3" />
+          <motion.div
+            animate={{ opacity: deviceStats.battery <= 20 ? [0.4, 1, 0.4] : 1 }}
+            transition={{ repeat: Infinity, duration: 1.5 }}
+          >
+            <Battery className={cn("w-3 h-3", deviceStats.battery <= 20 && "text-red-500")} />
+          </motion.div>
           <span>{deviceStats.battery}%</span>
         </div>
       </div>
@@ -797,25 +1250,38 @@ export default function App() {
             {activeTab === 'chat' && (
               <motion.div 
                 key="chat"
-                initial={{ opacity: 0, scale: 0.98 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.98 }}
+                initial={{ opacity: 0, x: -10, filter: "blur(10px)" }}
+                animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+                exit={{ opacity: 0, x: 10, filter: "blur(10px)" }}
+                transition={{ type: "spring", stiffness: 300, damping: 30 }}
                 className="flex flex-col h-full"
               >
-                {/* Navigation Tabs */}
-                <div className="flex gap-6 mb-6">
-                  {['chat', 'tasks'].map((tab) => (
-                    <button 
-                      key={tab}
-                      onClick={() => setActiveTab(tab as any)}
-                      className={cn(
-                        "text-[10px] uppercase tracking-[0.2em] font-black pb-2 border-b-2 transition-all",
-                        activeTab === tab ? cn("border-current", activeText) : "border-transparent opacity-30 hover:opacity-100"
-                      )}
-                    >
-                      {tab}
-                    </button>
-                  ))}
+                {/* Navigation & Search */}
+                <div className="flex justify-between items-center mb-6">
+                  <div className="flex gap-6">
+                    {['chat', 'tasks'].map((tab) => (
+                      <button 
+                        key={tab}
+                        onClick={() => setActiveTab(tab as any)}
+                        className={cn(
+                          "text-[10px] uppercase tracking-[0.2em] font-black pb-2 border-b-2 transition-all",
+                          activeTab === tab ? cn("border-current", activeText) : "border-transparent opacity-30 hover:opacity-100"
+                        )}
+                      >
+                        {tab}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="relative group/search">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 opacity-20 group-focus-within/search:opacity-60 transition-opacity" />
+                    <input 
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="SEARCH MEMORY..."
+                      className="bg-white/5 border border-white/10 rounded-full pl-8 pr-4 py-1.5 text-[8px] uppercase font-black tracking-widest focus:outline-none focus:border-white/20 transition-all w-24 sm:w-40"
+                    />
+                  </div>
                 </div>
 
                 <div 
@@ -826,7 +1292,12 @@ export default function App() {
                   {history.length === 0 && !transcript && (
                     <div className="flex flex-col items-center justify-center h-full text-center space-y-8 py-10">
                       <div className="opacity-20 flex flex-col items-center space-y-4">
-                        <Globe className="w-16 h-16 animate-pulse" />
+                        <motion.div
+                          animate={{ rotate: 360 }}
+                          transition={{ repeat: Infinity, duration: 20, ease: "linear" }}
+                        >
+                          <Globe className="w-16 h-16 animate-pulse" />
+                        </motion.div>
                         <p className="text-xs uppercase tracking-widest leading-relaxed">System Standby<br/>Waiting for Neural Input</p>
                       </div>
                       
@@ -856,21 +1327,29 @@ export default function App() {
                     </div>
                   )}
 
-                  {history.map((msg, idx) => (
+                  {history
+                    .filter(h => h.text.toLowerCase().includes(searchQuery.toLowerCase()))
+                    .map((msg, idx) => (
                     <motion.div 
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
                       key={idx}
+                      initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      transition={{ 
+                        type: "spring",
+                        stiffness: 260,
+                        damping: 20,
+                        delay: Math.min(idx * 0.05, 0.5) // Stagger for fresh history, capped
+                      }}
                       className={cn(
                         "flex",
                         msg.role === 'user' ? "justify-end" : "justify-start"
                       )}
                     >
                       <div className={cn(
-                        "max-w-[85%] px-5 py-3 rounded-2xl text-sm leading-relaxed",
+                        "max-w-[85%] px-5 py-3 rounded-2xl text-sm leading-relaxed transition-all duration-300",
                         msg.role === 'user' 
-                          ? "bg-white/5 border border-white/5 font-medium text-white/90" 
-                          : cn("bg-opacity-5 border backdrop-blur-md", activeShadow, activeBorder)
+                          ? "bg-white/5 border border-white/5 font-medium text-white/90 hover:bg-white/10" 
+                          : cn("bg-opacity-5 border backdrop-blur-md", activeShadow, activeBorder, "hover:bg-opacity-10")
                       )}>
                         {msg.image && (
                           <img src={msg.image} className="w-full max-w-xs object-cover rounded-xl mb-3 border border-white/10" alt="User upload" />
@@ -880,22 +1359,41 @@ export default function App() {
                     </motion.div>
                   ))}
 
+                  {/* Neural Typing Indicators */}
+                  {isProcessing && (
+                    <motion.div
+                      initial={{ opacity: 0, scale: 0.8 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      className="flex justify-start items-center gap-2 mb-2"
+                    >
+                      <div className={cn("w-6 h-6 rounded-full flex items-center justify-center", activeColor)}>
+                        <Globe className="w-3 h-3 text-white animate-pulse" />
+                      </div>
+                      <div className="bg-white/5 border border-white/5 rounded-2xl px-4 py-2 flex gap-1.5 items-center">
+                        <motion.div animate={{ scale: [1, 1.5, 1], opacity: [0.3, 1, 0.3] }} transition={{ repeat: Infinity, duration: 1, delay: 0 }} className={cn("w-1.5 h-1.5 rounded-full", activeColor)} />
+                        <motion.div animate={{ scale: [1, 1.5, 1], opacity: [0.3, 1, 0.3] }} transition={{ repeat: Infinity, duration: 1, delay: 0.2 }} className={cn("w-1.5 h-1.5 rounded-full", activeColor)} />
+                        <motion.div animate={{ scale: [1, 1.5, 1], opacity: [0.3, 1, 0.3] }} transition={{ repeat: Infinity, duration: 1, delay: 0.4 }} className={cn("w-1.5 h-1.5 rounded-full", activeColor)} />
+                        <span className="text-[8px] uppercase tracking-widest font-black opacity-30 ml-2">Neural Link Active</span>
+                      </div>
+                    </motion.div>
+                  )}
+
+                  {isUserTyping && (
+                    <motion.div 
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      className="flex justify-end pr-4"
+                    >
+                      <p className="text-[8px] uppercase tracking-widest font-black opacity-20 flex items-center gap-2">
+                        <Activity className="w-2 h-2 animate-pulse" /> Synaptic Transmission...
+                      </p>
+                    </motion.div>
+                  )}
+
                   {transcript && (
                     <div className="flex justify-end">
                       <div className="max-w-[85%] px-5 py-3 rounded-2xl text-sm bg-white/5 border border-white/10 italic text-white/40">
                         {transcript}
-                      </div>
-                    </div>
-                  )}
-
-                  {isProcessing && (
-                    <div className="flex justify-start">
-                      <div className="px-5 py-3 rounded-2xl bg-white/5 border border-white/5">
-                        <div className="flex gap-1.5">
-                          <div className={cn("w-1.5 h-1.5 rounded-full animate-bounce", activeColor)} style={{ animationDelay: '0ms' }} />
-                          <div className={cn("w-1.5 h-1.5 rounded-full animate-bounce", activeColor)} style={{ animationDelay: '150ms' }} />
-                          <div className={cn("w-1.5 h-1.5 rounded-full animate-bounce", activeColor)} style={{ animationDelay: '300ms' }} />
-                        </div>
                       </div>
                     </div>
                   )}
@@ -906,9 +1404,10 @@ export default function App() {
             {activeTab === 'tasks' && (
               <motion.div 
                 key="tasks"
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
+                initial={{ opacity: 0, y: 10, filter: "blur(10px)" }}
+                animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                exit={{ opacity: 0, y: -10, filter: "blur(10px)" }}
+                transition={{ type: "spring", stiffness: 300, damping: 30 }}
                 className="flex flex-col h-full bg-white/5 rounded-3xl border border-white/5 p-6 backdrop-blur-xl"
               >
                 <div className="flex justify-between items-center mb-6">
@@ -921,10 +1420,54 @@ export default function App() {
                     </button>
                     <h2 className="text-xs uppercase tracking-widest font-black opacity-40">Active Nodes</h2>
                   </div>
-                  <button onClick={() => setTasks([])} className="text-[10px] opacity-40 hover:opacity-100 hover:text-red-400 flex items-center gap-1 transition-colors">
+                  <button onClick={async () => {
+                    if (user) {
+                      const snapshot = await getDocs(collection(db, 'users', user.uid, 'tasks'))
+                        .catch(e => handleFirestoreError(e, OperationType.LIST, `users/${user.uid}/tasks`));
+                      if (snapshot) {
+                        snapshot.forEach(async d => await deleteDoc(doc(db, 'users', user.uid, 'tasks', d.id))
+                          .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${d.id}`)));
+                      }
+                    }
+                  }} className="text-[10px] opacity-40 hover:opacity-100 hover:text-red-400 flex items-center gap-1 transition-colors">
                     <Trash2 className="w-3 h-3" /> Clear Nodes
                   </button>
                 </div>
+
+                {/* Quick Add Node */}
+                <form 
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const input = (e.currentTarget.elements.namedItem('nodeValue') as HTMLInputElement);
+                    if (input.value.trim() && user) {
+                      const taskData = { 
+                        id: crypto.randomUUID(),
+                        type: 'MANUAL_ENTRY', 
+                        value: input.value.trim(), 
+                        time: 0, 
+                        userId: user.uid, 
+                        createdAt: serverTimestamp() 
+                      };
+                      await addDoc(collection(db, 'users', user.uid, 'tasks'), taskData)
+                        .catch(err => handleFirestoreError(err, OperationType.CREATE, `users/${user.uid}/tasks`));
+                      input.value = '';
+                    }
+                  }}
+                  className="mb-6 flex gap-2"
+                >
+                  <input 
+                    name="nodeValue"
+                    type="text"
+                    placeholder="RAPID UPLINK..."
+                    className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2 text-[10px] uppercase font-black tracking-widest focus:outline-none focus:border-white/30 transition-all placeholder:text-white/10"
+                  />
+                  <button 
+                    type="submit"
+                    className={cn("px-4 py-2 rounded-xl text-[10px] uppercase font-black tracking-widest transition-all", activeColor, "hover:opacity-80")}
+                  >
+                    Add
+                  </button>
+                </form>
                 
                 {tasks.length === 0 ? (
                   <div className="flex-1 flex flex-col items-center justify-center text-center opacity-20 py-20">
@@ -933,34 +1476,82 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="space-y-3 overflow-y-auto pr-2">
-                    <AnimatePresence>
-                      {tasks.map(task => (
+                    <AnimatePresence initial={false}>
+                      {tasks.map((task, idx) => (
                         <motion.div 
                           key={task.id}
-                          initial={{ opacity: 0, scale: 0.95 }}
-                          animate={{ opacity: 1, scale: 1 }}
+                          layout
+                          initial={{ opacity: 0, scale: 0.95, y: 20 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
                           exit={{ opacity: 0, scale: 0.9, x: 20 }}
+                          transition={{ 
+                            type: "spring",
+                            stiffness: 300,
+                            damping: 25,
+                            delay: Math.min(idx * 0.05, 0.3)
+                          }}
                           className="p-4 rounded-2xl bg-white/5 border border-white/5 flex items-center gap-4 group transition-all hover:bg-white/[0.07]"
                         >
                           <div className={cn("p-2 rounded-xl border", activeBorder)}>
                             {task.type === 'SET_TIMER' ? <div className="w-4 h-4 flex items-center justify-center font-mono text-[9px] font-black">{task.remaining}s</div> : <Globe className="w-4 h-4" />}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <p className="text-xs font-bold uppercase tracking-widest truncate">{task.type.replace('_', ' ')}</p>
+                            <div className="flex items-center gap-2">
+                              <p className="text-xs font-bold uppercase tracking-widest truncate">{task.type.replace('_', ' ')}</p>
+                              {task.dueAt && (
+                                <div className={cn(
+                                  "px-1.5 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter",
+                                  new Date(task.dueAt).getTime() - Date.now() < 3600000 
+                                    ? "bg-red-500/20 text-red-500 animate-pulse border border-red-500/30"
+                                    : "bg-white/10 text-white/40"
+                                )}>
+                                  {new Date(task.dueAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                </div>
+                              )}
+                            </div>
                             <p className="text-[10px] opacity-40 truncate">{task.value}</p>
                           </div>
                           <button 
-                            onClick={() => {
+                            onClick={async () => {
                               playCompleteSound();
-                              setTasks(prev => prev.filter(t => t.id !== task.id));
+                              if (user) {
+                                setCompletingTasks(prev => new Set([...prev, task.id]));
+                                // Delay deletion for animation
+                                setTimeout(async () => {
+                                  await deleteDoc(doc(db, 'users', user.uid, 'tasks', task.id))
+                                    .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${task.id}`));
+                                  setCompletingTasks(prev => {
+                                    const next = new Set(prev);
+                                    next.delete(task.id);
+                                    return next;
+                                  });
+                                }, 600);
+                              }
                             }}
-                            className="opacity-0 group-hover:opacity-100 p-2 text-white/30 hover:text-green-500 transition-all"
+                            className="opacity-0 group-hover:opacity-100 p-2 text-white/30 hover:text-green-500 transition-all relative"
                             title="Complete Task"
                           >
-                            <Check className="w-4 h-4" />
+                            <AnimatePresence>
+                              {completingTasks.has(task.id) && (
+                                <motion.div
+                                  initial={{ scale: 0, opacity: 0 }}
+                                  animate={{ scale: 2, opacity: 1 }}
+                                  exit={{ scale: 4, opacity: 0 }}
+                                  className="absolute inset-0 flex items-center justify-center pointer-events-none"
+                                >
+                                  <div className="w-1 h-1 bg-green-500 rounded-full" />
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                            <Check className={cn("w-4 h-4 transition-all", completingTasks.has(task.id) && "scale-150 text-green-500")} />
                           </button>
                           <button 
-                            onClick={() => setTasks(prev => prev.filter(t => t.id !== task.id))}
+                            onClick={async () => {
+                              if (user) {
+                                await deleteDoc(doc(db, 'users', user.uid, 'tasks', task.id))
+                                  .catch(e => handleFirestoreError(e, OperationType.DELETE, `users/${user.uid}/tasks/${task.id}`));
+                              }
+                            }}
                             className="opacity-0 group-hover:opacity-100 p-2 text-white/30 hover:text-red-500 transition-all"
                             title="Delete Task"
                           >
@@ -974,24 +1565,49 @@ export default function App() {
               </motion.div>
             )}
 
+            {activeTab === 'admin' && isAdmin && (
+              <AdminPanel 
+                 onClose={() => setActiveTab('settings')} 
+                 activeColor={activeColor}
+                 activeText={activeText}
+                 activeBorder={activeBorder}
+              />
+            )}
+
             {activeTab === 'settings' && (
               <motion.div 
                 key="settings"
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: 20 }}
+                initial={{ opacity: 0, x: 20, filter: "blur(10px)" }}
+                animate={{ opacity: 1, x: 0, filter: "blur(0px)" }}
+                exit={{ opacity: 0, x: 20, filter: "blur(10px)" }}
+                transition={{ type: "spring", stiffness: 300, damping: 30 }}
                 className="flex flex-col h-full space-y-8 bg-white/5 rounded-3xl border border-white/5 p-6 backdrop-blur-3xl overflow-y-auto"
               >
                 <div className="flex justify-between items-center">
                   <h2 className={cn("text-xs uppercase tracking-[0.3em] font-black", activeText)}>System Core</h2>
-                  <button onClick={() => setActiveTab('chat')} className="text-[10px] opacity-40 hover:opacity-100 flex items-center gap-1 transition-all">
-                    Exit Core
-                  </button>
+                  <div className="flex gap-2">
+                    {isAdmin && (
+                      <button 
+                        onClick={() => setActiveTab('admin')}
+                        className="px-3 py-2 rounded-xl bg-cyan-500/20 border border-cyan-500/30 text-cyan-400 text-[10px] font-black tracking-widest uppercase hover:bg-cyan-500/30 transition-all flex items-center gap-1"
+                      >
+                        <ShieldAlert className="w-3 h-3" /> Admin
+                      </button>
+                    )}
+                    <button onClick={() => setActiveTab('chat')} className="text-[10px] opacity-40 hover:opacity-100 flex items-center gap-1 transition-all">
+                      Exit Core
+                    </button>
+                  </div>
                 </div>
 
                 <div className="space-y-6">
                   {/* User Profile */}
-                  <div className="space-y-4">
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.1 }}
+                    className="space-y-4"
+                  >
                     {isCameraActive ? (
                       <div className="relative w-full aspect-square max-h-64 sm:max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center">
                         <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
@@ -1033,31 +1649,71 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                  </div>
 
-                  {/* Neural Theme */}
-                  <div className="space-y-3">
-                    <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Neural Theme</label>
-                    <div className="grid grid-cols-3 gap-2">
-                      {['cyan', 'purple', 'green', 'forest', 'ocean', 'minimalist'].map(theme => (
-                        <button 
-                          key={theme}
-                          onClick={() => setSettings({ ...settings, theme })}
-                          className={cn(
-                            "py-3 rounded-2xl border transition-all active:scale-95 text-[10px] uppercase font-black tracking-widest",
-                            settings.theme === theme 
-                              ? cn("bg-white/10 border-white/20 scale-105", activeText)
-                              : "bg-white/5 border-transparent opacity-40"
-                          )}
-                        >
-                          {theme}
-                        </button>
-                      ))}
+                    {/* Neural Analytics */}
+                    <div className="grid grid-cols-2 gap-3 pt-2">
+                      <div className="bg-white/5 border border-white/10 rounded-2xl p-4 flex flex-col items-center justify-center gap-1 group hover:bg-white/[0.08] transition-all">
+                        <span className="text-[8px] uppercase tracking-widest font-black opacity-30">Synaptic Linkage</span>
+                        <span className={cn("text-xl font-bold tracking-tighter", activeText)}>{history.length}</span>
+                        <span className="text-[7px] uppercase font-bold opacity-20">Traces Cached</span>
+                      </div>
+                      <div className="bg-white/5 border border-white/10 rounded-2xl p-4 flex flex-col items-center justify-center gap-1 group hover:bg-white/[0.08] transition-all">
+                        <span className="text-[8px] uppercase tracking-widest font-black opacity-30">Node Clusters</span>
+                        <span className={cn("text-xl font-bold tracking-tighter", activeText)}>{tasks.length}</span>
+                        <span className="text-[7px] uppercase font-bold opacity-20">Active Uplinks</span>
+                      </div>
                     </div>
-                  </div>
+                  </motion.div>
+
+                    {/* Neural Theme */}
+                    <motion.div 
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: 0.2 }}
+                      className="space-y-3"
+                    >
+                      <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Neural Theme</label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {['cyan', 'purple', 'green', 'forest', 'ocean', 'minimalist'].map(theme => (
+                          <motion.button 
+                            key={theme}
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => setSettings({ ...settings, theme })}
+                            className={cn(
+                              "py-3 rounded-2xl border transition-all text-[10px] uppercase font-black tracking-widest",
+                              settings.theme === theme 
+                                ? cn("bg-white/10 border-white/20 shadow-lg", activeText, activeShadow)
+                                : "bg-white/5 border-transparent opacity-40 hover:opacity-70"
+                            )}
+                          >
+                            {theme}
+                          </motion.button>
+                        ))}
+                      </div>
+
+                      {/* Custom Accent Color */}
+                      <div className="pt-2">
+                        <label className="text-[8px] uppercase tracking-widest font-black opacity-20 mb-2 block">Neural Tint</label>
+                        <div className="flex items-center gap-4">
+                          <input 
+                            type="color" 
+                            value={settings.accentColor || '#06b6d4'}
+                            onChange={(e) => setSettings({ ...settings, accentColor: e.target.value })}
+                            className="bg-transparent border-none w-8 h-8 rounded cursor-pointer [&::-webkit-color-swatch-wrapper]:p-0 [&::-webkit-color-swatch]:rounded-lg [&::-webkit-color-swatch]:border-none shadow-lg"
+                          />
+                          <p className="text-[10px] font-mono opacity-30 tracking-widest">{settings.accentColor?.toUpperCase()}</p>
+                        </div>
+                      </div>
+                    </motion.div>
 
                   {/* Voice Speed */}
-                  <div className="space-y-3">
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.3 }}
+                    className="space-y-3"
+                  >
                     <div className="flex justify-between items-center">
                       <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Neural Rate</label>
                       <span className="text-[10px] font-mono opacity-60">{settings.voiceSpeed}x</span>
@@ -1071,10 +1727,15 @@ export default function App() {
                       onChange={(e) => setSettings({ ...settings, voiceSpeed: parseFloat(e.target.value) })}
                       className={cn("w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-current", activeText)}
                     />
-                  </div>
+                  </motion.div>
 
                   {/* Voice Pitch */}
-                  <div className="space-y-3">
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.4 }}
+                    className="space-y-3"
+                  >
                     <div className="flex justify-between items-center">
                       <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Neural Pitch</label>
                       <span className="text-[10px] font-mono opacity-60">{settings.voicePitch}</span>
@@ -1088,10 +1749,15 @@ export default function App() {
                       onChange={(e) => setSettings({ ...settings, voicePitch: parseFloat(e.target.value) })}
                       className={cn("w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-current", activeText)}
                     />
-                  </div>
+                  </motion.div>
 
                   {/* Auto-Listen Toggle */}
-                  <div className="flex items-center justify-between p-4 bg-white/5 border border-white/5 rounded-2xl">
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.5 }}
+                    className="flex items-center justify-between p-4 bg-white/5 border border-white/5 rounded-2xl"
+                  >
                     <div>
                       <h3 className="text-xs uppercase tracking-widest font-black opacity-80">Auto-Listen Mode</h3>
                       <p className="text-[10px] opacity-40 mt-1">Say "Aura" to wake assistant</p>
@@ -1116,7 +1782,7 @@ export default function App() {
                         settings.autoListen ? "left-7" : "left-1"
                       )} />
                     </button>
-                  </div>
+                  </motion.div>
 
                   {/* Auto-Listen Sensitivity Slider */}
                   {settings.autoListen && (
@@ -1167,19 +1833,65 @@ export default function App() {
                     </button>
                   </div>
 
+                  {/* Device Status Dashboard */}
+                  <div className="space-y-3">
+                    <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Real-Time Diagnostics</label>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="p-4 bg-white/5 border border-white/5 rounded-2xl flex flex-col gap-2">
+                        <div className="flex items-center gap-2 opacity-50 text-[10px] uppercase tracking-widest font-black">
+                          <Wifi className="w-3 h-3" />
+                          <span>Network</span>
+                        </div>
+                        <div className="text-lg font-mono font-bold tracking-tight text-white flex items-center gap-2">
+                          <div className={cn("w-2 h-2 rounded-full", deviceStats.online ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+                          {deviceStats.networkType}
+                        </div>
+                        <div className="text-xs font-mono opacity-40">{deviceStats.networkSpeed}</div>
+                      </div>
+
+                      <div className="p-4 bg-white/5 border border-white/5 rounded-2xl flex flex-col gap-2">
+                        <div className="flex items-center gap-2 opacity-50 text-[10px] uppercase tracking-widest font-black">
+                          <Battery className="w-3 h-3" />
+                          <span>Power Array</span>
+                        </div>
+                        <div className="text-lg font-mono font-bold tracking-tight text-white flex items-center gap-2">
+                          {deviceStats.battery}%
+                        </div>
+                        <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden mt-1">
+                          <div 
+                            className={cn(
+                              "h-full rounded-full transition-all duration-1000",
+                              deviceStats.battery <= 20 ? "bg-red-500" : "bg-cyan-400"
+                            )}
+                            style={{ width: `${deviceStats.battery}%` }}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Reset Control */}
-                  <button 
-                    onClick={() => {
-                      if (confirm('Clear entire chat history?')) {
-                        setHistory([]);
-                        setTasks([]);
-                        setActiveTab('chat');
-                      }
-                    }}
-                    className="w-full mt-4 py-5 rounded-2xl bg-red-500/20 border border-red-500/30 text-red-500 text-xs uppercase tracking-[0.2em] font-black hover:bg-red-500/30 transition-all active:scale-95 flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
-                  >
-                    <Trash2 className="w-4 h-4" /> Clear Chat History
-                  </button>
+                  <div className="flex flex-col gap-3">
+                    <button 
+                      onClick={() => {
+                        if (confirm('Clear entire chat history?')) {
+                          setHistory([]);
+                          setTasks([]);
+                          setActiveTab('chat');
+                        }
+                      }}
+                      className="w-full mt-4 py-5 rounded-2xl bg-red-500/20 border border-red-500/30 text-red-500 text-xs uppercase tracking-[0.2em] font-black hover:bg-red-500/30 transition-all active:scale-95 flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(239,68,68,0.2)]"
+                    >
+                      <Trash2 className="w-4 h-4" /> Clear Chat History
+                    </button>
+
+                    <button 
+                      onClick={handleLogout}
+                      className="w-full py-5 rounded-2xl bg-white/5 border border-white/10 text-white/40 text-xs uppercase tracking-[0.2em] font-black hover:bg-white/10 transition-all active:scale-95 flex items-center justify-center gap-2"
+                    >
+                      <LogOut className="w-4 h-4" /> Logout from Nexus
+                    </button>
+                  </div>
                 </div>
               </motion.div>
             )}
@@ -1280,7 +1992,12 @@ export default function App() {
                   <input 
                     type="text" 
                     value={inputText}
-                    onChange={(e) => setInputText(e.target.value)}
+                    onChange={(e) => {
+                      setInputText(e.target.value);
+                      setIsUserTyping(true);
+                      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+                      typingTimeoutRef.current = setTimeout(() => setIsUserTyping(false), 1500);
+                    }}
                     placeholder="Input Neural Query..."
                     className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:border-white/30 transition-all placeholder:text-white/20"
                     autoFocus

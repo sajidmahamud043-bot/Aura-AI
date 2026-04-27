@@ -90,9 +90,12 @@ Example for an action ("Open WhatsApp and say hi to Mom"):
     return response.text || "দুঃখিত, আমি কোনো উত্তর খুঁজে পাইনি।";
   } catch (error: any) {
     console.error("Gemini API Error:", error);
-    if (error.message?.includes("API_KEY") || error.message?.includes("configured")) {
-      return "Error: Gemini API key is missing or invalid. Please click the 'Settings' gear icon and add your GEMINI_API_KEY to the Secrets panel.";
+    if (!navigator.onLine) {
+      throw new Error("No network connection. Please check your internet connection.");
     }
-    return "দুঃখিত, আমি এই মুহূর্তে কাজ করতে পারছি না। দয়া করে আবার চেষ্টা করুন।";
+    if (error.message?.includes("API_KEY") || error.message?.includes("configured")) {
+      throw new Error("Gemini API key is invalid or missing. Please check your settings.");
+    }
+    throw new Error("I hit a snag. Please wait a moment and try again.");
   }
 }
