@@ -277,7 +277,7 @@ export default function App() {
   useEffect(() => {
     const unsub = onSnapshot(doc(db, 'system', 'config'), (snap) => {
       if (snap.exists()) setSystemConfig(snap.data());
-    });
+    }, (err) => handleFirestoreError(err, OperationType.GET, 'system/config'));
     return () => unsub();
   }, []);
   
