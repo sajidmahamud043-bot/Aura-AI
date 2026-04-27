@@ -5,7 +5,7 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X } from 'lucide-react';
 import { getAssistantResponse } from './services/geminiService';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
@@ -100,13 +100,17 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcript, setTranscript] = useState('');
-  const [history, setHistory] = useState<{ role: 'user' | 'model', text: string }[]>([]);
+  const [history, setHistory] = useState<{ role: 'user' | 'model', text: string, image?: string }[]>([]);
   const [tasks, setTasks] = useState<{ id: string; type: string; value: string; time: number; remaining?: number }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [deviceStats, setDeviceStats] = useState({ battery: 100, online: navigator.onLine, location: 'Scanning...', networkType: 'WiFi', networkSpeed: 'Fast' });
   const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings'>('chat');
   const [wakeDetected, setWakeDetected] = useState(false);
   const wakeTriggeredRef = useRef(false);
+  
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   
   const playWakeSound = useCallback(() => {
     try {
@@ -204,6 +208,7 @@ export default function App() {
     const parsed = saved ? JSON.parse(saved) : {};
     return {
       userName: 'Sajid',
+      profilePic: '',
       voiceSpeed: 1.05,
       voicePitch: 1.1,
       theme: 'cyan',
@@ -387,15 +392,74 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  const handleUserCommand = async (command: string) => {
-    if (!command.trim()) return;
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+      streamRef.current = stream;
+      setIsCameraActive(true);
+    } catch (err) {
+      console.error("Camera access denied or unavailable", err);
+      setError("Unable to access the camera.");
+    }
+  };
+
+  useEffect(() => {
+    if (isCameraActive && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+    }
+  }, [isCameraActive]);
+
+  const stopCamera = useCallback(() => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsCameraActive(false);
+  }, []);
+
+  const capturePhoto = () => {
+    if (videoRef.current) {
+      const canvas = document.createElement('canvas');
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+        setSettings({ ...settings, profilePic: dataUrl });
+        stopCamera();
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'settings' && isCameraActive) {
+      stopCamera();
+    }
+  }, [activeTab, isCameraActive, stopCamera]);
+
+  const handleUserCommand = async (command: string, imageBase64?: string) => {
+    if (!command.trim() && !imageBase64) return;
     
     setIsProcessing(true);
-    setHistory(prev => [...prev, { role: 'user', text: command }]);
+    setHistory(prev => [...prev, { role: 'user', text: command || '[Image Uploaded]', image: imageBase64 }]);
     
     try {
-      const geminiHistory = history.map(h => ({ role: h.role, parts: [{ text: h.text }] }));
-      const response = await getAssistantResponse(command, geminiHistory);
+      const geminiHistory = history.map(h => {
+        const parts: any[] = [{ text: h.text }];
+        if (h.image) {
+          const mimeType = h.image.substring(h.image.indexOf(":") + 1, h.image.indexOf(";"));
+          const base64Data = h.image.substring(h.image.indexOf(",") + 1);
+          parts.push({
+            inlineData: {
+              mimeType,
+              data: base64Data
+            }
+          });
+        }
+        return { role: h.role, parts };
+      });
+      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64);
       
       let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').trim();
 
@@ -808,6 +872,9 @@ export default function App() {
                           ? "bg-white/5 border border-white/5 font-medium text-white/90" 
                           : cn("bg-opacity-5 border backdrop-blur-md", activeShadow, activeBorder)
                       )}>
+                        {msg.image && (
+                          <img src={msg.image} className="w-full max-w-xs object-cover rounded-xl mb-3 border border-white/10" alt="User upload" />
+                        )}
                         <ReactMarkdown>{msg.text}</ReactMarkdown>
                       </div>
                     </motion.div>
@@ -924,15 +991,48 @@ export default function App() {
 
                 <div className="space-y-6">
                   {/* User Profile */}
-                  <div className="space-y-3">
-                    <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Identity Alias</label>
-                    <input 
-                      type="text" 
-                      value={settings.userName}
-                      onChange={(e) => setSettings({ ...settings, userName: e.target.value })}
-                      className="w-full bg-white/5 border border-white/5 rounded-2xl px-5 py-3 text-sm focus:outline-none focus:border-white/20 transition-all"
-                      placeholder="Input Name"
-                    />
+                  <div className="space-y-4">
+                    {isCameraActive ? (
+                      <div className="relative w-full aspect-square max-h-64 sm:max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center">
+                        <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                        <div className="absolute inset-x-0 bottom-0 p-4 pb-6 flex justify-center items-center gap-8 bg-gradient-to-t from-black/80 to-transparent">
+                          <button onClick={stopCamera} className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95">
+                            <X className="w-6 h-6" />
+                          </button>
+                          <button onClick={capturePhoto} className="p-4 bg-white text-black rounded-full shadow-[0_0_20px_rgba(255,255,255,0.4)] hover:shadow-[0_0_30px_rgba(255,255,255,0.6)] transition-all active:scale-95">
+                            <Camera className="w-8 h-8" />
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
+                        <div className="relative group shrink-0">
+                          <div className="w-16 h-16 rounded-full overflow-hidden bg-white/5 flex items-center justify-center border-2 border-white/10 group-hover:border-white/30 transition-colors">
+                            {settings.profilePic ? (
+                              <img src={settings.profilePic} className="w-full h-full object-cover" alt="Profile" />
+                            ) : (
+                              <Activity className="w-8 h-8 opacity-30" />
+                            )}
+                          </div>
+                          <button 
+                            onClick={startCamera}
+                            className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-full transition-opacity cursor-pointer"
+                          >
+                            <Camera className="w-6 h-6 text-white" />
+                          </button>
+                        </div>
+                        <div className="flex-1 w-full space-y-3">
+                          <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Identity Alias</label>
+                          <input 
+                            type="text" 
+                            value={settings.userName}
+                            onChange={(e) => setSettings({ ...settings, userName: e.target.value })}
+                            className="w-full bg-white/5 border border-white/5 rounded-2xl px-5 py-3 text-sm focus:outline-none focus:border-white/20 transition-all"
+                            placeholder="Input Name"
+                          />
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Neural Theme */}
@@ -1141,6 +1241,30 @@ export default function App() {
                 className="p-3 sm:p-4 rounded-full border border-white/5 bg-white/5 transition-all text-white/30 hover:text-white active:scale-90"
               >
                 <MessageSquare className="w-5 h-5 sm:w-6 sm:h-6" />
+              </button>
+
+              <button 
+                onClick={() => {
+                  const input = document.createElement('input');
+                  input.type = 'file';
+                  input.accept = 'image/*';
+                  input.capture = 'environment';
+                  input.onchange = (e) => {
+                    const file = (e.target as HTMLInputElement).files?.[0];
+                    if (file) {
+                      const reader = new FileReader();
+                      reader.onload = (ev) => {
+                        const imgBase64 = ev.target?.result as string;
+                        handleUserCommand('', imgBase64);
+                      };
+                      reader.readAsDataURL(file);
+                    }
+                  };
+                  input.click();
+                }}
+                className="p-3 sm:p-4 rounded-full border border-white/5 bg-white/5 transition-all text-white/30 hover:text-white active:scale-90"
+              >
+                <Camera className="w-5 h-5 sm:w-6 sm:h-6" />
               </button>
             </div>
             

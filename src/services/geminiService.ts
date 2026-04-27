@@ -18,7 +18,7 @@ function getAI() {
   return genAI;
 }
 
-export async function getAssistantResponse(prompt: string, history: { role: 'user' | 'model', parts: { text: string }[] }[] = []) {
+export async function getAssistantResponse(prompt: string, history: { role: 'user' | 'model', parts: any[] }[] = [], imageBase64?: string) {
   try {
     const ai = getAI();
     
@@ -26,7 +26,23 @@ export async function getAssistantResponse(prompt: string, history: { role: 'use
       role: h.role,
       parts: h.parts
     }));
-    contents.push({ role: 'user', parts: [{ text: prompt }] });
+    
+    const currentParts: any[] = [{ text: prompt }];
+    
+    if (imageBase64) {
+      // imageBase64 is typically something like "data:image/jpeg;base64,..."
+      const mimeType = imageBase64.substring(imageBase64.indexOf(":") + 1, imageBase64.indexOf(";"));
+      const base64Data = imageBase64.substring(imageBase64.indexOf(",") + 1);
+      
+      currentParts.push({
+        inlineData: {
+          mimeType,
+          data: base64Data
+        }
+      });
+    }
+    
+    contents.push({ role: 'user', parts: currentParts });
 
     const response = await ai.models.generateContent({
       model: "gemini-3-flash-preview",
@@ -34,6 +50,11 @@ export async function getAssistantResponse(prompt: string, history: { role: 'use
       config: {
         systemInstruction: `You are Aura, an advanced smart voice assistant for a smartphone.
 Languages: English and Bengali-Latin (Romanized Bengali, e.g., "Kemon achen?").
+
+Contextual Memory & Rules:
+- Always refer back to the current conversation history to maintain flow.
+- If the user mentions a preference (e.g., "I like my coffee black", "call me Boss"), store this context implicitly and use it in future relevant responses.
+- Never ask the same question twice if the answer was already provided in the session.
 
 1. NORMAL CONVERSATION: If the user is just chatting or asking a question, respond naturally in concise text. Mirror the user's language.
 

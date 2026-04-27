@@ -1,0 +1,6 @@
+{
+  "appId": "com.auravoice.app",
+  "appName": "Aura Voice AI",
+  "webDir": "dist",
+  "bundledWebRuntime": false
+}
