@@ -1,0 +1,6 @@
+{
+  "name": "Aura Voice AI",
+  "description": "A high-performance, futuristic AI voice assistant with automation capabilities and a responsive mobile-first design.",
+  "requestFramePermissions": ["microphone", "geolocation"],
+  "majorCapabilities": ["voice_recognition", "text_to_speech", "ai_automation"]
+}
