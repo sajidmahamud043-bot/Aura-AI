@@ -19,6 +19,17 @@
         "role": { "type": "string", "enum": ["user", "model"] },
         "text": { "type": "string" },
         "image": { "type": "string" },
+        "files": { 
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "url": { "type": "string" },
+              "name": { "type": "string" },
+              "type": { "type": "string" }
+            }
+          }
+        },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["role", "text", "createdAt"]

@@ -5,12 +5,12 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, ArrowLeft, Check, Activity, Camera, X, ShieldAlert, Zap, Search, UserCircle, Menu, Plus, Paperclip, Send } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, ArrowLeft, Check, Activity, Camera, X, ShieldAlert, Zap, Search, UserCircle, Menu, Plus, Paperclip, Send, FileText, Table, Presentation, FileArchive, File as LucideFile } from 'lucide-react';
 import { getAssistantResponse } from './services/geminiService';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
 import UserProfile from './components/UserProfile';
-import { auth, db, onAuthStateChanged, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, setDoc, getDocs, deleteDoc } from './lib/firebase';
+import { auth, db, storage, ref, uploadBytes, getDownloadURL, onAuthStateChanged, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, setDoc, getDocs, deleteDoc } from './lib/firebase';
 
 // Types for Speech Recognition
 interface SpeechRecognitionEvent extends Event {
@@ -107,11 +107,13 @@ export default function App() {
   const [completingTasks, setCompletingTasks] = useState<Set<string>>(new Set());
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [transcript, setTranscript] = useState('');
-  const [history, setHistory] = useState<{ role: 'user' | 'model', text: string, image?: string }[]>([]);
+  const [history, setHistory] = useState<{ role: 'user' | 'model', text: string, image?: string | null, files?: { url: string, name: string, type: string }[] }[]>([]);
   const [tasks, setTasks] = useState<{ id: string; type: string; value: string; time: number; remaining?: number; dueAt?: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isUserTyping, setIsUserTyping] = useState(false);
+  const [selectedFiles, setSelectedFiles] = useState<{ id: string, file: File, preview?: string, type: 'image' | 'pdf' | 'doc' | 'sheet' | 'slide' | 'archive' | 'other', caption?: string }[]>([]);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const latestTranscriptRef = useRef('');
   const isActuallyListeningRef = useRef(false);
 
@@ -136,76 +138,6 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Sync History and Tasks with Firestore when logged in
-  useEffect(() => {
-    if (!user) {
-      // If not logged in, load from local storage
-      const savedTasks = localStorage.getItem(`aura_tasks_local`);
-      if (savedTasks) setTasks(JSON.parse(savedTasks));
-      
-      const savedHistory = localStorage.getItem(`aura_history_local`);
-      if (savedHistory) setHistory(JSON.parse(savedHistory));
-      return;
-    }
-
-    // Load History from Firestore
-    const historyQuery = query(
-      collection(db, 'users', user.uid, 'history'),
-      orderBy('createdAt', 'asc')
-    );
-
-    const unsubHistory = onSnapshot(historyQuery, (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({
-        role: doc.data().role,
-        text: doc.data().text,
-        image: doc.data().image
-      }));
-      setHistory(docs as any);
-    });
-
-    // Load Tasks from Firestore
-    const tasksQuery = query(
-      collection(db, 'users', user.uid, 'tasks'),
-      orderBy('time', 'desc')
-    );
-
-    const unsubTasks = onSnapshot(tasksQuery, (snapshot) => {
-      const docs = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      }));
-      setTasks(docs as any);
-    });
-
-    return () => {
-      unsubHistory();
-      unsubTasks();
-    };
-  }, [user]);
-
-  // Persist to LocalStorage only if not logged in
-  useEffect(() => {
-    if (!user) {
-      localStorage.setItem(`aura_tasks_local`, JSON.stringify(tasks));
-    }
-  }, [tasks, user]);
-
-  useEffect(() => {
-    if (!user) {
-      localStorage.setItem(`aura_history_local`, JSON.stringify(history));
-    }
-  }, [history, user]);
-
-  useEffect(() => {
-    if (user && user.email) {
-      // Sync local username with Firebase email/metadata if not set
-      if (settings.userName === 'Sajid' || !settings.userName) {
-        const nameFromEmail = user.email.split('@')[0];
-        setSettings(prev => ({ ...prev, userName: nameFromEmail }));
-      }
-    }
-  }, [user]);
-
   const [wakeDetected, setWakeDetected] = useState(false);
   const [systemConfig, setSystemConfig] = useState<any>({
     features: {
@@ -228,6 +160,10 @@ export default function App() {
   */
   
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [cameraZoom, setCameraZoom] = useState(1);
+  const [hasZoomSupport, setHasZoomSupport] = useState(false);
+  const [cameraCapabilities, setCameraCapabilities] = useState<any>(null);
+  const [cameraMode, setCameraMode] = useState<'profile' | 'chat'>('chat');
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   
@@ -322,7 +258,7 @@ export default function App() {
   const [inputText, setInputText] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Settings with Persistence
+  // Settings with Persistence (Local initial, synced via useEffect)
   const [settings, setSettings] = useState(() => {
     const saved = localStorage.getItem('aura_settings');
     const parsed = saved ? JSON.parse(saved) : {};
@@ -344,10 +280,105 @@ export default function App() {
   const isSpeakingRef = useRef(isSpeaking);
   const isHoldToTalkRef = useRef(isHoldToTalk);
 
+  // Sync History, Tasks and Settings with Database when logged in
+  useEffect(() => {
+    if (!user) {
+      // If not logged in, load from local storage
+      const savedTasks = localStorage.getItem(`aura_tasks_local`);
+      if (savedTasks) setTasks(JSON.parse(savedTasks));
+      
+      const savedHistory = localStorage.getItem(`aura_history_local`);
+      if (savedHistory) setHistory(JSON.parse(savedHistory));
+      return;
+    }
+
+    let unsubSettings: () => void = () => {};
+    let unsubHistory: () => void = () => {};
+    let unsubTasks: () => void = () => {};
+
+    // Firebase Syncer
+    // Load Settings from Firestore
+    const userDocRef = doc(db, 'users', user.uid);
+    const unsubS = onSnapshot(userDocRef, (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setSettings(prev => ({
+          ...prev,
+          userName: data.userName || user.displayName || 'Sajid',
+          profilePic: data.profilePic || '',
+          ...data.settings
+        }));
+      }
+    });
+    unsubSettings = unsubS;
+
+    // Load History from Firestore
+    const historyQuery = query(
+      collection(db, 'users', user.uid, 'history'),
+      orderBy('createdAt', 'asc')
+    );
+
+    const unsubH = onSnapshot(historyQuery, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({
+        role: doc.data().role,
+        text: doc.data().text,
+        image: doc.data().image,
+        files: doc.data().files || []
+      }));
+      setHistory(docs as any);
+    });
+    unsubHistory = unsubH;
+
+    // Load Tasks from Firestore
+    const tasksQuery = query(
+      collection(db, 'users', user.uid, 'tasks'),
+      orderBy('time', 'desc')
+    );
+
+    const unsubT = onSnapshot(tasksQuery, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setTasks(docs as any);
+    });
+    unsubTasks = unsubT;
+
+    return () => {
+      unsubSettings();
+      unsubHistory();
+      unsubTasks();
+    };
+  }, [user]);
+
+  // Persist to LocalStorage only if not logged in
+  useEffect(() => {
+    if (!user) {
+      localStorage.setItem(`aura_tasks_local`, JSON.stringify(tasks));
+    }
+  }, [tasks, user]);
+
+  useEffect(() => {
+    if (!user) {
+      localStorage.setItem(`aura_history_local`, JSON.stringify(history));
+    }
+  }, [history, user]);
+
+  // Persist Settings to Firestore and LocalStorage
   useEffect(() => {
     settingsRef.current = settings;
     localStorage.setItem('aura_settings', JSON.stringify(settings));
-  }, [settings]);
+    
+    if (user) {
+      const { userName, profilePic, ...otherSettings } = settings;
+      setDoc(doc(db, 'users', user.uid), {
+        userName,
+        profilePic,
+        settings: otherSettings,
+        updatedAt: serverTimestamp()
+      }, { merge: true });
+    }
+  }, [settings, user]);
 
   // Personalized Greeting on Start
   useEffect(() => {
@@ -372,6 +403,61 @@ export default function App() {
     }
   }, [settings.userName]);
 
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    files.forEach(file => {
+      const name = file.name.toLowerCase();
+      const mime = file.type.toLowerCase();
+      
+      let type: 'image' | 'pdf' | 'doc' | 'sheet' | 'slide' | 'archive' | 'other' = 'other';
+      
+      if (mime.startsWith('image/')) {
+        type = 'image';
+      } else if (mime === 'application/pdf' || name.endsWith('.pdf')) {
+        type = 'pdf';
+      } else if (mime.includes('word') || mime.includes('text') || name.endsWith('.doc') || name.endsWith('.docx') || name.endsWith('.txt') || name.endsWith('.rtf')) {
+        type = 'doc';
+      } else if (mime.includes('spreadsheet') || mime.includes('excel') || mime.includes('csv') || name.endsWith('.xls') || name.endsWith('.xlsx') || name.endsWith('.csv')) {
+        type = 'sheet';
+      } else if (mime.includes('presentation') || mime.includes('powerpoint') || name.endsWith('.ppt') || name.endsWith('.pptx')) {
+        type = 'slide';
+      } else if (mime.includes('zip') || mime.includes('rar') || mime.includes('tar') || mime.includes('7z') || name.endsWith('.zip') || name.endsWith('.rar')) {
+        type = 'archive';
+      }
+
+      const newFileObj: any = {
+        id: Math.random().toString(36).substr(2, 9),
+        file,
+        type,
+        caption: ''
+      };
+
+      if (type === 'image') {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          newFileObj.preview = reader.result as string;
+          setSelectedFiles(prev => [...prev, newFileObj]);
+        };
+        reader.readAsDataURL(file);
+      } else {
+        setSelectedFiles(prev => [...prev, newFileObj]);
+      }
+    });
+
+    // Reset input
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const updateFileCaption = (id: string, caption: string) => {
+    setSelectedFiles(prev => prev.map(f => f.id === id ? { ...f, caption } : f));
+  };
+
+  const removeFile = (id: string) => {
+    setSelectedFiles(prev => prev.filter(f => f.id !== id));
+  };
+
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
   }, [isSpeaking]);
@@ -384,13 +470,75 @@ export default function App() {
   const synthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const handleTextInput = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (inputText.trim()) {
-      handleUserCommand(inputText, undefined, 'text');
-      setInputText('');
-      setShowInput(false);
+  const [isUploading, setIsUploading] = useState(false);
+
+  const uploadFileToStorage = async (fileOrBlob: File | Blob, folder: string) => {
+    if (!user) return null;
+    try {
+      setIsUploading(true);
+      const fileName = `${Date.now()}-${Math.random().toString(36).substring(7)}`;
+      const fileRef = ref(storage, `users/${user.uid}/${folder}/${fileName}`);
+      const snapshot = await uploadBytes(fileRef, fileOrBlob);
+      const url = await getDownloadURL(snapshot.ref);
+      return url;
+    } catch (error) {
+      console.error("Storage upload failed:", error);
+      return null;
+    } finally {
+      setIsUploading(false);
     }
+  };
+
+  const handleTextInput = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputText.trim() && selectedFiles.length === 0) return;
+    
+    let textToSend = inputText.trim();
+    const uploadedFiles: { url: string, name: string, type: string, caption?: string }[] = [];
+
+    // Process all files
+    for (const f of selectedFiles) {
+      let finalUrl = f.preview || '';
+      
+      if (user) {
+        const folder = f.type === 'image' ? 'chat_images' : 'chat_files';
+        const uploadedUrl = await uploadFileToStorage(f.file, folder);
+        if (uploadedUrl) finalUrl = uploadedUrl;
+      }
+      
+      uploadedFiles.push({
+        url: finalUrl,
+        name: f.file.name,
+        type: f.type,
+        caption: f.caption
+      });
+    }
+
+    // Combine text and captions
+    let combinedText = textToSend;
+    const captions = selectedFiles
+      .filter(f => f.caption && f.caption.trim())
+      .map(f => `File: ${f.file.name}\nCaption: ${f.caption}`)
+      .join('\n\n');
+
+    if (captions) {
+      combinedText = combinedText ? `${combinedText}\n\n${captions}` : captions;
+    }
+
+    // Default text if nothing else
+    if (!combinedText && selectedFiles.length > 0) {
+      combinedText = `[Sent ${selectedFiles.length} file${selectedFiles.length > 1 ? 's' : ''}]`;
+    }
+
+    // For vision: we use the first image only for now as per geminiService limit
+    const imageFile = selectedFiles.find(f => f.type === 'image');
+    let visionBase64 = imageFile?.preview || '';
+    let firstImageUrl = uploadedFiles.find(f => f.type === 'image')?.url || visionBase64;
+
+    handleUserCommand(combinedText, firstImageUrl, 'text', visionBase64, uploadedFiles);
+    setInputText('');
+    setSelectedFiles([]);
+    setShowInput(false);
   };
 
   useEffect(() => {
@@ -524,26 +672,62 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  const startCamera = async () => {
+  const startCamera = async (mode: 'profile' | 'chat' = 'chat') => {
+    setCameraMode(mode);
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setError("Your browser does not support camera access.");
+      setError("Your browser does not support camera access. Please use a modern browser like Chrome, Edge, or Safari.");
       return;
     }
 
     try {
+      // Clear previous error
+      setError(null);
+      
+      // Attempt to stop existing stream if any
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+
       // Try with preferred constraints first
       let stream;
       try {
+        // We use ideal values to allow browser to downscale
         stream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: 'user' } 
+          video: { 
+            facingMode: 'user', 
+            width: { ideal: 1280 }, 
+            height: { ideal: 720 }
+          } 
         });
-      } catch (e) {
-        // Fallback to basic video if facingMode fails
-        console.warn("Retrying camera with basic constraints...");
-        stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      } catch (e: any) {
+        console.warn("Primary camera constraints failed, retrying with minimal constraints...", e);
+        // Try with absolutely minimal constraints
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        } catch (e2: any) {
+          // If even basic video fails, try one more time without any specific requirements
+          console.warn("Minimal constraints failed, one last try...", e2);
+          throw e2; 
+        }
       }
 
       streamRef.current = stream;
+      
+      // Get camera capabilities for zoom/focus
+      const track = stream.getVideoTracks()[0];
+      if (track && typeof track.getCapabilities === 'function') {
+        try {
+          const capabilities = track.getCapabilities() as any;
+          setCameraCapabilities(capabilities);
+          if (capabilities.zoom) {
+            setHasZoomSupport(true);
+            setCameraZoom(capabilities.zoom.min || 1);
+          }
+        } catch (capErr) {
+          console.warn("Failed to get camera capabilities:", capErr);
+        }
+      }
+
       setIsCameraActive(true);
       
       // Delay assignment slightly to ensure video element is mounted in the DOM
@@ -551,22 +735,46 @@ export default function App() {
         if (videoRef.current && streamRef.current) {
           videoRef.current.srcObject = streamRef.current;
         }
-      }, 300);
+      }, 500);
 
     } catch (err: any) {
       console.error("Camera access denied or unavailable", err);
       let msg = "Unable to access the camera.";
-      if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError' || (err.message && err.message.toLowerCase().includes('found'))) {
+      const errName = err.name || '';
+      const errMsg = err.message || '';
+      
+      if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError' || errMsg.toLowerCase().includes('not found') || errMsg.toLowerCase().includes('object can not be found')) {
         msg = "No camera device detected. Please connect a camera and try again.";
-      } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || (err.message && err.message.toLowerCase().includes('denied'))) {
-        msg = "Camera permission denied. If you're in an iframe, try opening the app in a new tab.";
-      } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-        msg = "Camera is already in use by another application.";
+      } else if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errMsg.toLowerCase().includes('denied')) {
+        msg = "Camera permission denied. Please allow camera access in your browser settings.";
+      } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
+        msg = "Camera is already in use by another application or tab.";
+      } else if (errName === 'OverconstrainedError') {
+        msg = "The requested camera settings are not supported by your device.";
       } else if (window.self !== window.top) {
-        msg = "Camera access blocked. Try opening the app in a new tab (iframe restriction).";
+        msg = "Camera access blocked by security restrictions. Try opening the app in a new tab.";
+      } else {
+        msg = `Camera Error: ${errMsg || errName || 'Unknown error'}`;
       }
       setError(msg);
       setIsCameraActive(false);
+    }
+  };
+
+  const applyZoom = async (value: number) => {
+    setCameraZoom(value);
+    if (streamRef.current) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track && 'applyConstraints' in track) {
+        try {
+          await track.applyConstraints({
+            // @ts-ignore
+            advanced: [{ zoom: value }]
+          });
+        } catch (e) {
+          console.warn("Zoom not supported by track constraints", e);
+        }
+      }
     }
   };
 
@@ -586,6 +794,9 @@ export default function App() {
       streamRef.current = null;
     }
     setIsCameraActive(false);
+    setCameraCapabilities(null);
+    setHasZoomSupport(false);
+    setCameraZoom(1);
   }, []);
 
   const capturePhoto = () => {
@@ -595,27 +806,78 @@ export default function App() {
       canvas.height = videoRef.current.videoHeight;
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        // Visual flash overlay
+        const flash = document.createElement('div');
+        flash.className = 'fixed inset-0 bg-white z-[1000] pointer-events-none opacity-100';
+        document.body.appendChild(flash);
+        setTimeout(() => {
+          flash.style.transition = 'opacity 0.4s ease-out';
+          flash.style.opacity = '0';
+          setTimeout(() => document.body.removeChild(flash), 400);
+        }, 50);
+
         ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
-        setSettings({ ...settings, profilePic: dataUrl });
-        stopCamera();
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+        
+        if (cameraMode === 'profile') {
+          // If logged in, upload profile pic to storage
+          if (user) {
+            canvas.toBlob(async (blob) => {
+              if (blob) {
+                const uploadedUrl = await uploadFileToStorage(blob, 'profile_pics');
+                if (uploadedUrl) {
+                  setSettings({ ...settings, profilePic: uploadedUrl });
+                }
+              }
+              stopCamera();
+            }, 'image/jpeg', 0.9);
+          } else {
+            setSettings({ ...settings, profilePic: dataUrl });
+            stopCamera();
+          }
+        } else {
+          // Chat mode capture - just add to selection, handleTextInput will upload
+          const fileId = Math.random().toString(36).substr(2, 9);
+          fetch(dataUrl)
+            .then(res => res.blob())
+            .then(blob => {
+              const file = new File([blob], `capture_${Date.now()}.jpg`, { type: 'image/jpeg' });
+              setSelectedFiles(prev => [...prev, {
+                id: fileId,
+                file,
+                preview: dataUrl,
+                type: 'image'
+              }]);
+              stopCamera();
+            });
+        }
       }
     }
   };
 
   useEffect(() => {
-    if (activeTab !== 'settings' && isCameraActive) {
-      stopCamera();
+    // Auto-stop camera if user navigates away from the context where it was opened
+    if (isCameraActive) {
+      if (cameraMode === 'chat' && activeTab !== 'chat') {
+        stopCamera();
+      } else if (cameraMode === 'profile' && (activeTab !== 'settings' && activeTab !== 'profile')) {
+        stopCamera();
+      }
     }
-  }, [activeTab, isCameraActive, stopCamera]);
+  }, [activeTab, isCameraActive, cameraMode, stopCamera]);
 
-  const handleUserCommand = async (command: string, imageBase64?: string, mode: 'text' | 'voice' = 'text') => {
-    if (!command.trim() && !imageBase64) return;
+  const handleUserCommand = async (command: string, imageUrl?: string, mode: 'text' | 'voice' = 'text', visionBase64?: string, uploadedFiles?: { url: string, name: string, type: string }[]) => {
+    if (!command.trim() && !imageUrl && (!uploadedFiles || uploadedFiles.length === 0)) return;
     
     setIsProcessing(true);
     const lowerCommand = (command || '').toLowerCase();
 
-    const userMessage = { role: 'user' as const, text: command || '[Image Uploaded]', image: imageBase64 || null };
+    const userMessage = { 
+      role: 'user' as const, 
+      text: command || '[File Uploaded]', 
+      image: imageUrl || null,
+      files: uploadedFiles || []
+    };
     setHistory(prev => [...prev, userMessage]);
 
     if (user) {
@@ -631,7 +893,9 @@ export default function App() {
         parts: [{ text: h.text }]
       }));
 
-      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64);
+      // Use visionBase64 if provided, otherwise fallback to imageUrl if it's base64
+      const visionData = visionBase64 || (imageUrl?.startsWith('data:') ? imageUrl : undefined);
+      const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, visionData);
       
       let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').replace(/```json[\s\S]*?```/g, '').trim();
       const modelMessage = { role: 'model' as const, text: cleanResponse };
@@ -668,11 +932,12 @@ export default function App() {
       if (actionMatch) {
           const [, type, value] = actionMatch;
           const taskId = Math.random().toString(36).substr(2, 9);
-          const newTask = {
+          const newTask: any = {
             type: type,
             value: value,
             time: Date.now(),
-            createdAt: new Date().toISOString()
+            createdAt: new Date().toISOString(),
+            dueAt: null // Explicitly initialize
           };
 
           if (user) {
@@ -769,8 +1034,13 @@ export default function App() {
         utterance.onstart = () => setIsSpeaking(true);
         utterance.onend = () => {
           setIsSpeaking(false);
-          if (settingsRef.current.autoListen) {
-            try { recognitionRef.current?.start(); } catch (e) {}
+          if (settingsRef.current.autoListen && !isActuallyListeningRef.current) {
+            try { 
+              isActuallyListeningRef.current = true;
+              recognitionRef.current?.start(); 
+            } catch (e) {
+              isActuallyListeningRef.current = false;
+            }
           }
         };
         utterance.onerror = (e) => {
@@ -810,13 +1080,16 @@ export default function App() {
       setTimeout(() => {
         try {
           if (recognitionRef.current && !isActuallyListeningRef.current) {
+            isActuallyListeningRef.current = true; // Set early to prevent race conditions
             recognitionRef.current.start();
           }
         } catch (err: any) {
+          isActuallyListeningRef.current = false;
           console.error("Recognition start failed:", err);
           setIsListening(false);
-          if (err.message && err.message.includes('found')) {
-            setError("Neural listener is unavailable. Please refresh or check your microphone.");
+          const errMsg = err.message || '';
+          if (errMsg.toLowerCase().includes('found')) {
+            setError("Neural listener is unavailable. Please verify microphone access.");
           }
         }
       }, 300);
@@ -839,8 +1112,10 @@ export default function App() {
       setIsSpeaking(false);
       
       try {
+        isActuallyListeningRef.current = true;
         recognitionRef.current?.start();
       } catch (err) {
+        isActuallyListeningRef.current = false;
         console.error("HTT Start failed:", err);
       }
     }
@@ -1164,6 +1439,39 @@ export default function App() {
                         {msg.image && (
                           <img src={msg.image} className="w-full max-w-xs object-cover rounded-xl mb-3 border border-white/10" alt="User upload" />
                         )}
+                        {msg.files && msg.files.length > 0 && (
+                          <div className="flex flex-wrap gap-2 mb-3">
+                            {msg.files.map((file, fidx) => (
+                              <a 
+                                key={fidx}
+                                href={file.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center gap-2 bg-white/5 border border-white/10 px-3 py-2 rounded-xl hover:bg-white/10 transition-all group/file-link"
+                              >
+                                <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center border border-white/10 shrink-0">
+                                  {file.type === 'pdf' ? (
+                                    <FileText className="w-4 h-4 text-red-400" />
+                                  ) : file.type === 'doc' ? (
+                                    <FileText className="w-4 h-4 text-blue-400" />
+                                  ) : file.type === 'sheet' ? (
+                                    <Table className="w-4 h-4 text-green-400" />
+                                  ) : file.type === 'slide' ? (
+                                    <Presentation className="w-4 h-4 text-orange-400" />
+                                  ) : file.type === 'archive' ? (
+                                    <FileArchive className="w-4 h-4 text-yellow-500" />
+                                  ) : (
+                                    <LucideFile className="w-4 h-4 text-gray-400" />
+                                  )}
+                                </div>
+                                <div className="flex flex-col min-w-0 max-w-[120px]">
+                                  <span className="text-[10px] font-bold text-white/90 truncate">{file.name}</span>
+                                  <span className="text-[8px] text-white/40 uppercase tracking-widest font-black">Download</span>
+                                </div>
+                              </a>
+                            ))}
+                          </div>
+                        )}
                         <ReactMarkdown>{msg.text}</ReactMarkdown>
                       </div>
                     </motion.div>
@@ -1406,40 +1714,72 @@ export default function App() {
                     transition={{ delay: 0.1 }}
                     className="space-y-4"
                   >
-                    {isCameraActive ? (
-                      <div className="relative w-full aspect-square max-h-64 sm:max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center shadow-lg shadow-black/50">
+                    {isCameraActive && cameraMode === 'profile' ? (
+                      <div className="relative w-full aspect-square max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center shadow-2xl">
                         <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-                        <div className="absolute inset-x-0 bottom-0 p-4 pb-6 flex justify-center items-center gap-8 bg-gradient-to-t from-black/80 to-transparent">
-                          <button onClick={stopCamera} className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95 border border-white/5">
-                            <X className="w-6 h-6" />
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/40 via-transparent to-transparent pointer-events-none" />
+                        
+                        {/* Zoom Control Overlay */}
+                        {hasZoomSupport && (
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2 flex flex-col items-center gap-3 bg-black/40 backdrop-blur-md p-2 rounded-full border border-white/10">
+                            <span className="text-[8px] font-black text-white/40">Z</span>
+                            <div className="h-32 w-1 relative bg-white/10 rounded-full overflow-hidden">
+                              <input 
+                                type="range"
+                                min={cameraCapabilities?.zoom?.min || 1}
+                                max={cameraCapabilities?.zoom?.max || 3}
+                                step="0.1"
+                                value={cameraZoom}
+                                onChange={(e) => applyZoom(parseFloat(e.target.value))}
+                                className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-32 -rotate-90 bg-transparent appearance-none cursor-pointer accent-cyan-400"
+                              />
+                            </div>
+                            <span className="text-[8px] font-mono text-white/40">{cameraZoom.toFixed(1)}x</span>
+                          </div>
+                        )}
+
+                        <div className="absolute inset-x-0 bottom-0 p-4 pb-6 flex justify-center items-center gap-6">
+                          <button onClick={stopCamera} className="p-3 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all border border-white/5">
+                            <X className="w-5 h-5" />
                           </button>
-                          <button onClick={capturePhoto} className="p-4 bg-white text-black rounded-full shadow-[0_0_20px_rgba(255,255,255,0.4)] hover:shadow-[0_0_30px_rgba(255,255,255,0.6)] transition-all active:scale-95">
-                            <Camera className="w-8 h-8" />
+                          <button 
+                            onClick={capturePhoto} 
+                            className={cn("p-4 rounded-full shadow-2xl transition-all active:scale-95", activeColor)}
+                          >
+                            <Camera className="w-7 h-7 text-white" />
                           </button>
                         </div>
                       </div>
                     ) : (
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4">
-                        <div className="relative group shrink-0">
-                          <div className="w-16 h-16 rounded-full overflow-hidden bg-white/5 flex items-center justify-center border-2 border-white/10 group-hover:border-white/30 transition-colors">
-                            {settings.profilePic ? (
-                              <img src={settings.profilePic} className="w-full h-full object-cover" alt="Profile" />
-                            ) : (
-                              <Activity className="w-8 h-8 opacity-30" />
-                            )}
-                          </div>
+                    <div className="flex flex-col sm:flex-row items-start sm:items-center gap-6">
+                      <div className="relative group shrink-0">
+                        <div className={cn("w-20 h-20 rounded-full overflow-hidden bg-white/5 flex items-center justify-center border-2 transition-all duration-500", activeBorder)}>
+                          {settings.profilePic ? (
+                            <img src={settings.profilePic} className="w-full h-full object-cover" alt="Profile" />
+                          ) : (
+                            <UserCircle className="w-10 h-10 opacity-30" />
+                          )}
                         </div>
-                        <div className="flex-1 w-full space-y-3">
-                          <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Account</label>
+                        <button 
+                          onClick={() => startCamera('profile')}
+                          className={cn("absolute -bottom-1 -right-1 p-2 rounded-full shadow-lg transition-all active:scale-95", activeColor)}
+                        >
+                          <Camera className="w-3.5 h-3.5 text-white" />
+                        </button>
+                      </div>
+                      <div className="flex-1 w-full space-y-3">
+                        <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Neural Identity</label>
+                        <div className="flex items-center gap-2">
                           <input 
                             type="text" 
                             value={settings.userName}
                             onChange={(e) => setSettings({ ...settings, userName: e.target.value })}
-                            className="w-full bg-white/5 border border-white/5 rounded-2xl px-5 py-3 text-sm focus:outline-none focus:border-white/20 transition-all"
+                            className="flex-1 bg-white/5 border border-white/5 rounded-2xl px-5 py-3 text-sm focus:outline-none focus:border-white/20 transition-all font-bold tracking-tight"
                             placeholder="Input Name"
                           />
                         </div>
                       </div>
+                    </div>
                     )}
 
                     {/* Neural Analytics */}
@@ -1636,30 +1976,84 @@ export default function App() {
           </AnimatePresence>
         </div>
 
-        {/* Camera Overlay */}
+        {/* Enhanced Camera Overlay */}
         <AnimatePresence>
-          {isCameraActive && activeTab === 'chat' && (
+          {isCameraActive && cameraMode === 'chat' && (
             <motion.div 
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[90%] max-w-sm aspect-square sm:aspect-video rounded-3xl overflow-hidden bg-black border-2 border-white/10 z-[100] shadow-[0_0_50px_rgba(0,0,0,0.8)]"
+              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[90%] max-w-sm aspect-square sm:aspect-video rounded-3xl overflow-hidden bg-black border-2 border-white/10 z-[300] shadow-[0_0_80px_rgba(0,0,0,0.9)]"
             >
               <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-              <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent pointer-events-none" />
-              <div className="absolute inset-x-0 bottom-0 p-6 flex justify-center items-center gap-8">
+              
+              {/* Camera UI Elements */}
+              <div className="absolute inset-0 border border-white/5 pointer-events-none">
+                 <div className="absolute top-4 left-4 flex items-center gap-2">
+                    <div className="w-1.5 h-1.5 rounded-full bg-red-600 animate-pulse" />
+                    <span className="text-[10px] font-black uppercase tracking-[0.3em] text-white/60">Rec Interface</span>
+                 </div>
+                 {/* Viewfinder Corners */}
+                 <div className="absolute top-6 left-6 w-4 h-4 border-t border-l border-white/30" />
+                 <div className="absolute top-6 right-6 w-4 h-4 border-t border-r border-white/30" />
+                 <div className="absolute bottom-6 left-6 w-4 h-4 border-b border-l border-white/30" />
+                 <div className="absolute bottom-6 right-6 w-4 h-4 border-b border-r border-white/30" />
+              </div>
+
+              {/* Zoom and Focus Controls */}
+              <div className="absolute right-6 top-1/2 -translate-y-1/2 flex flex-col items-center gap-6 bg-black/40 backdrop-blur-2xl p-3 rounded-full border border-white/10">
+                 <button 
+                  onClick={() => {
+                    const track = streamRef.current?.getVideoTracks()[0];
+                    // @ts-ignore
+                    track?.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
+                  }}
+                  className="p-2 hover:bg-white/10 rounded-full transition-colors text-cyan-400"
+                  title="Auto Focus"
+                 >
+                    <Search className="w-4 h-4" />
+                 </button>
+                 
+                 {hasZoomSupport && (
+                   <div className="flex flex-col items-center gap-4">
+                      <Zap className="w-3 h-3 text-white/40" />
+                      <div className="h-32 w-1.5 relative bg-white/5 rounded-full">
+                          <input 
+                            type="range"
+                            min={cameraCapabilities?.zoom?.min || 1}
+                            max={cameraCapabilities?.zoom?.max || 3}
+                            step="0.1"
+                            value={cameraZoom}
+                            onChange={(e) => applyZoom(parseFloat(e.target.value))}
+                            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-32 -rotate-90 bg-transparent appearance-none cursor-pointer accent-cyan-400"
+                          />
+                      </div>
+                      <span className="text-[8px] font-mono text-white/60">{cameraZoom.toFixed(1)}x</span>
+                   </div>
+                 )}
+              </div>
+
+              <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent pointer-events-none" />
+              <div className="absolute inset-x-0 bottom-0 p-8 flex justify-center items-center gap-10">
                 <button 
                   onClick={stopCamera} 
-                  className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95 border border-white/5"
+                  className="p-4 bg-white/5 backdrop-blur-xl rounded-full text-white/40 hover:text-white hover:bg-white/10 transition-all active:scale-95 border border-white/10"
                 >
                   <X className="w-6 h-6" />
                 </button>
-                <button 
-                  onClick={capturePhoto} 
-                  className={cn("p-5 rounded-full shadow-2xl transition-all active:scale-95", activeColor, activeShadow)}
-                >
-                  <Camera className="w-8 h-8 text-white" />
-                </button>
+                <div className="relative">
+                  <motion.div 
+                    animate={{ scale: [1, 1.1, 1] }} 
+                    transition={{ repeat: Infinity, duration: 2 }}
+                    className={cn("absolute -inset-4 opacity-20 blur-xl rounded-full", activeColor)}
+                  />
+                  <button 
+                    onClick={capturePhoto} 
+                    className={cn("relative p-6 rounded-full shadow-2xl transition-all active:scale-90 border border-white/20", activeColor)}
+                  >
+                    <Camera className="w-10 h-10 text-white" />
+                  </button>
+                </div>
               </div>
             </motion.div>
           )}
@@ -1702,6 +2096,79 @@ export default function App() {
 
             {/* Main Chat Box Container */}
             <div className="relative group">
+              {/* File Previews */}
+              <AnimatePresence>
+                {selectedFiles.length > 0 && (
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                    className="absolute bottom-full left-0 right-0 mb-4 flex gap-2 p-2 overflow-x-auto no-scrollbar scroll-smooth"
+                  >
+                    <div className="flex gap-2">
+                      {selectedFiles.map((f) => (
+                        <motion.div 
+                          key={f.id}
+                          layout
+                          initial={{ opacity: 0, scale: 0.8 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          exit={{ opacity: 0, scale: 0.8 }}
+                          className="relative group/file bg-black/40 backdrop-blur-2xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl flex items-center p-2 gap-3 min-w-[140px]"
+                        >
+                          <div className="w-12 h-12 rounded-xl shrink-0 overflow-hidden flex items-center justify-center bg-white/5 border border-white/10">
+                            {f.type === 'image' ? (
+                              <img src={f.preview} alt="preview" className="w-full h-full object-cover" />
+                            ) : f.type === 'pdf' ? (
+                              <FileText className="w-6 h-6 text-red-400" />
+                            ) : f.type === 'doc' ? (
+                              <FileText className="w-6 h-6 text-blue-400" />
+                            ) : f.type === 'sheet' ? (
+                              <Table className="w-6 h-6 text-green-400" />
+                            ) : f.type === 'slide' ? (
+                              <Presentation className="w-6 h-6 text-orange-400" />
+                            ) : f.type === 'archive' ? (
+                              <FileArchive className="w-6 h-6 text-yellow-500" />
+                            ) : (
+                              <LucideFile className="w-6 h-6 text-gray-400" />
+                            )}
+                          </div>
+                          <div className="flex flex-col flex-1 min-w-0 pr-10">
+                              <div className="flex flex-col gap-0.5">
+                                 <span className="text-[10px] font-bold text-white/90 truncate">{f.file.name}</span>
+                                 <span className="text-[8px] text-white/40 uppercase tracking-widest font-black">
+                                   {f.type === 'pdf' ? 'PDF Document' : 
+                                    f.type === 'image' ? 'Image' : 
+                                    f.type === 'doc' ? 'Word/Text' : 
+                                    f.type === 'sheet' ? 'Spreadsheet' : 
+                                    f.type === 'slide' ? 'Presentation' : 
+                                    f.type === 'archive' ? 'Archive' : 'File'}
+                                 </span>
+                              </div>
+                              <input 
+                                type="text"
+                                placeholder="Add a caption..."
+                                value={f.caption || ''}
+                                onChange={(e) => updateFileCaption(f.id, e.target.value)}
+                                className="mt-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-[10px] text-white placeholder:text-white/30 focus:outline-none focus:border-cyan-500/50 transition-all"
+                              />
+                          </div>
+                          <button 
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              removeFile(f.id);
+                            }}
+                            className="absolute top-2 right-2 bg-red-500/80 hover:bg-red-500 text-white rounded-full p-1 opacity-0 group-hover/file:opacity-100 transition-all duration-300 transform scale-90"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </motion.div>
+                      ))}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {/* Tool Menu Extension */}
               <AnimatePresence>
                 {showTools && (
@@ -1723,7 +2190,7 @@ export default function App() {
                     </button>
                     <button 
                       onClick={() => {
-                        alert("File upload system initiated...");
+                        fileInputRef.current?.click();
                         setShowTools(false);
                       }}
                       className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 rounded-xl transition-all text-white/70 hover:text-white"
@@ -1731,6 +2198,14 @@ export default function App() {
                       <Paperclip className="w-4 h-4 text-purple-400" />
                       <span className="text-[10px] font-black uppercase tracking-widest">Post File</span>
                     </button>
+                    <input 
+                      type="file"
+                      ref={fileInputRef}
+                      onChange={handleFileSelect}
+                      multiple
+                      accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,text/plain"
+                      className="hidden"
+                    />
                     <div className="h-[1px] bg-white/5 my-1" />
                     <button 
                       onClick={() => {
@@ -1749,18 +2224,30 @@ export default function App() {
               {/* Chat Input Bar */}
               <form 
                 onSubmit={handleTextInput}
-                className="flex items-end gap-2 bg-[#1a1a1c] border border-white/10 rounded-[28px] p-2 pl-3 focus-within:border-white/20 transition-all shadow-lg"
+                className="flex items-end gap-2 bg-[#1a1a1c]/80 backdrop-blur-3xl border border-white/10 rounded-[32px] p-2 pl-3 focus-within:border-white/20 transition-all shadow-2xl relative z-[100]"
               >
-                <button 
-                  type="button"
-                  onClick={() => setShowTools(!showTools)}
-                  className={cn(
-                    "p-3 rounded-full transition-all active:scale-90 flex items-center justify-center mb-0.5",
-                    showTools ? "bg-white/10 text-white" : "text-white/40 hover:text-white hover:bg-white/5"
-                  )}
-                >
-                  <Plus className={cn("w-5 h-5 transition-transform duration-300", showTools && "rotate-45")} />
-                </button>
+                {isUploading && (
+                  <div className="absolute -top-12 left-1/2 -translate-x-1/2 bg-cyan-500/20 backdrop-blur-xl border border-cyan-500/30 px-4 py-1.5 rounded-full flex items-center gap-2 animate-pulse">
+                    <Activity className="w-3 h-3 text-cyan-400 animate-spin" />
+                    <span className="text-[10px] font-black uppercase tracking-widest text-cyan-400">Syncing to Cloud...</span>
+                  </div>
+                )}
+                <div className="relative group">
+                  <button 
+                    type="button"
+                    onClick={() => setShowTools(!showTools)}
+                    className={cn(
+                      "p-3.5 rounded-full transition-all active:scale-90 flex items-center justify-center mb-0.5 relative overflow-hidden",
+                      showTools ? "bg-white/10 text-white" : "text-white/40 hover:text-white hover:bg-white/5"
+                    )}
+                  >
+                    <Plus className={cn("w-5 h-5 transition-transform duration-500", showTools && "rotate-45")} />
+                    <motion.div 
+                      className="absolute inset-0 bg-white/5 opacity-0 group-hover:opacity-100 transition-opacity"
+                      initial={false}
+                    />
+                  </button>
+                </div>
 
                 <textarea 
                   rows={1}
@@ -1778,7 +2265,7 @@ export default function App() {
                     }
                   }}
                   placeholder="Ask Aura..."
-                  className="flex-1 bg-transparent border-none px-2 py-3.5 text-[15px] focus:outline-none placeholder:text-white/20 resize-none min-h-[48px] max-h-32 text-white/90"
+                  className="flex-1 bg-transparent border-none px-2 py-3.5 text-[15px] focus:outline-none placeholder:text-white/20 resize-none min-h-[48px] max-h-32 text-white/90 scroll-smooth no-scrollbar"
                 />
 
                 <div className="flex items-center gap-1 mb-0.5 mr-0.5">
@@ -1886,28 +2373,8 @@ export default function App() {
               </form>
             </div>
             
-            {/* Visual Feedback for Voice */}
             <AnimatePresence>
-              {(isListening || transcript) && (
-                <motion.div 
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 10 }}
-                  className="mt-3 flex flex-col items-center gap-2"
-                >
-                  <div className="flex gap-1 items-center px-4 py-1.5 bg-black/40 border border-white/5 rounded-full">
-                     <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
-                     <span className="text-[9px] font-black uppercase tracking-widest text-cyan-400/80">
-                        {isHoldToTalk ? 'Release to Send' : 'Listening...'}
-                     </span>
-                  </div>
-                  {transcript && (
-                    <p className="text-[11px] text-white/40 font-medium italic text-center max-w-xs truncate px-4">
-                       "{transcript}"
-                    </p>
-                  )}
-                </motion.div>
-              )}
+              {/* Visual feedback removed per user request */}
             </AnimatePresence>
           </div>
         </div>

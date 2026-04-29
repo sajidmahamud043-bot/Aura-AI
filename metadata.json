@@ -1,6 +1,5 @@
 {
   "name": "Aura Voice AI",
   "description": "A high-performance AI voice assistant with Supabase Auth, Firestore persistence, and a powerful Admin Control Protocol.",
-  "requestFramePermissions": ["microphone", "geolocation", "camera"],
-  "majorCapabilities": ["voice_recognition", "text_to_speech", "ai_automation"]
+  "requestFramePermissions": ["microphone", "geolocation", "camera"]
 }

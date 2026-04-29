@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { User, LogIn, LogOut, Mail, Lock, UserCircle, Shield, Globe, Terminal, Loader2, X } from 'lucide-react';
-import { auth, googleProvider, signInWithPopup, signOut, onAuthStateChanged } from '../lib/firebase';
-import { createUserWithEmailAndPassword, signInWithEmailAndPassword } from 'firebase/auth';
+import { auth, googleProvider, signInWithPopup, signOut, onAuthStateChanged, createUserWithEmailAndPassword, signInWithEmailAndPassword } from '../lib/firebase';
 import { cn } from '../lib/utils';
 
 interface UserProfileProps {
