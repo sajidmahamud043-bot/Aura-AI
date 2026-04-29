@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User settings and profile data",
+      "type": "object",
+      "properties": {
+        "userName": { "type": "string" },
+        "settings": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userName"]
+    },
+    "HistoryItem": {
+      "title": "Chat History Item",
+      "description": "A single message in the chat history",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "text": { "type": "string" },
+        "image": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "text", "createdAt"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "A user task or reminder",
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "value": { "type": "string" },
+        "time": { "type": "number" },
+        "remaining": { "type": "number" },
+        "dueAt": { "type": "string" }
+      },
+      "required": ["type", "value", "time"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile and settings"
+    },
+    "/users/{userId}/history/{msgId}": {
+      "schema": "HistoryItem",
+      "description": "User chat history"
+    },
+    "/users/{userId}/tasks/{taskId}": {
+      "schema": "Task",
+      "description": "User tasks"
+    }
+  }
+}

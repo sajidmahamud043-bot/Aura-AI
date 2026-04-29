@@ -5,10 +5,12 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, Phone, ArrowLeft, Check, Activity, Camera, X, ShieldAlert, Zap, Search } from 'lucide-react';
+import { Mic, MicOff, Volume2, VolumeX, Settings, MessageSquare, History, Globe, Battery, Wifi, Signal, Trash2, ArrowLeft, Check, Activity, Camera, X, ShieldAlert, Zap, Search, UserCircle, Menu, Plus, Paperclip, Send } from 'lucide-react';
 import { getAssistantResponse } from './services/geminiService';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
+import UserProfile from './components/UserProfile';
+import { auth, db, onAuthStateChanged, collection, query, orderBy, onSnapshot, addDoc, serverTimestamp, doc, setDoc, getDocs, deleteDoc } from './lib/firebase';
 
 // Types for Speech Recognition
 interface SpeechRecognitionEvent extends Event {
@@ -98,7 +100,9 @@ function checkWakeWord(transcript: string, sensitivity: number): { detected: boo
 export default function App() {
   const [loading, setLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isHoldToTalk, setIsHoldToTalk] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [showTools, setShowTools] = useState(false);
   const [sessionGreeted, setSessionGreeted] = useState(false);
   const [completingTasks, setCompletingTasks] = useState<Set<string>>(new Set());
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -108,6 +112,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [isUserTyping, setIsUserTyping] = useState(false);
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const latestTranscriptRef = useRef('');
+  const isActuallyListeningRef = useRef(false);
 
   const clearError = () => setError(null);
 
@@ -119,38 +125,86 @@ export default function App() {
   }, [error]);
 
   const [deviceStats, setDeviceStats] = useState({ battery: 100, online: navigator.onLine, location: 'Scanning...', networkType: 'WiFi', networkSpeed: 'Fast' });
-  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'tasks' | 'settings' | 'profile'>('chat');
+  const [user, setUser] = useState<any>(null);
 
-  // Use LocalStorage for Persistence
   useEffect(() => {
-    const savedTasks = localStorage.getItem(`aura_tasks_local`);
-    if (savedTasks) setTasks(JSON.parse(savedTasks));
-    
-    const savedHistory = localStorage.getItem(`aura_history_local`);
-    if (savedHistory) setHistory(JSON.parse(savedHistory));
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+
+    return () => unsubscribe();
   }, []);
 
+  // Sync History and Tasks with Firestore when logged in
   useEffect(() => {
-    localStorage.setItem(`aura_tasks_local`, JSON.stringify(tasks));
-  }, [tasks]);
-
-  useEffect(() => {
-    localStorage.setItem(`aura_history_local`, JSON.stringify(history));
-  }, [history]);
-
-  useEffect(() => {
-    if (!sessionGreeted) {
-      const userName = settings.userName || 'User';
-      const msg = `Hello ${userName}, how are you? I'm always here to help you!!`;
+    if (!user) {
+      // If not logged in, load from local storage
+      const savedTasks = localStorage.getItem(`aura_tasks_local`);
+      if (savedTasks) setTasks(JSON.parse(savedTasks));
       
-      setHistory(prev => {
-        if (prev.length > 0 && prev[prev.length-1].text === msg) return prev;
-        return [...prev, { role: 'model', text: msg }];
-      });
-      speak(msg);
-      setSessionGreeted(true);
+      const savedHistory = localStorage.getItem(`aura_history_local`);
+      if (savedHistory) setHistory(JSON.parse(savedHistory));
+      return;
     }
-  }, [sessionGreeted]);
+
+    // Load History from Firestore
+    const historyQuery = query(
+      collection(db, 'users', user.uid, 'history'),
+      orderBy('createdAt', 'asc')
+    );
+
+    const unsubHistory = onSnapshot(historyQuery, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({
+        role: doc.data().role,
+        text: doc.data().text,
+        image: doc.data().image
+      }));
+      setHistory(docs as any);
+    });
+
+    // Load Tasks from Firestore
+    const tasksQuery = query(
+      collection(db, 'users', user.uid, 'tasks'),
+      orderBy('time', 'desc')
+    );
+
+    const unsubTasks = onSnapshot(tasksQuery, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setTasks(docs as any);
+    });
+
+    return () => {
+      unsubHistory();
+      unsubTasks();
+    };
+  }, [user]);
+
+  // Persist to LocalStorage only if not logged in
+  useEffect(() => {
+    if (!user) {
+      localStorage.setItem(`aura_tasks_local`, JSON.stringify(tasks));
+    }
+  }, [tasks, user]);
+
+  useEffect(() => {
+    if (!user) {
+      localStorage.setItem(`aura_history_local`, JSON.stringify(history));
+    }
+  }, [history, user]);
+
+  useEffect(() => {
+    if (user && user.email) {
+      // Sync local username with Firebase email/metadata if not set
+      if (settings.userName === 'Sajid' || !settings.userName) {
+        const nameFromEmail = user.email.split('@')[0];
+        setSettings(prev => ({ ...prev, userName: nameFromEmail }));
+      }
+    }
+  }, [user]);
 
   const [wakeDetected, setWakeDetected] = useState(false);
   const [systemConfig, setSystemConfig] = useState<any>({
@@ -280,7 +334,7 @@ export default function App() {
       theme: 'cyan',
       accentColor: '#06b6d4',
       autoListen: false,
-      autoListenSensitivity: 3, // 1 to 5
+      autoListenSensitivity: 3, 
       hapticFeedback: true,
       ...parsed
     };
@@ -288,15 +342,43 @@ export default function App() {
 
   const settingsRef = useRef(settings);
   const isSpeakingRef = useRef(isSpeaking);
+  const isHoldToTalkRef = useRef(isHoldToTalk);
 
   useEffect(() => {
     settingsRef.current = settings;
     localStorage.setItem('aura_settings', JSON.stringify(settings));
   }, [settings]);
 
+  // Personalized Greeting on Start
+  useEffect(() => {
+    const hasGreeted = sessionStorage.getItem('aura_initial_greet');
+    if (!hasGreeted && settings.userName) {
+      const greetingText = `Hello, I'm Aura AI, how can I help you ${settings.userName}?`;
+      
+      // Delay slightly for smooth entrance
+      const timer = setTimeout(() => {
+        setHistory(prev => [...prev, { role: 'model', text: greetingText }]);
+        
+        // AI speaks the greeting
+        const utterance = new SpeechSynthesisUtterance(greetingText);
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => setIsSpeaking(false);
+        window.speechSynthesis.speak(utterance);
+        
+        sessionStorage.setItem('aura_initial_greet', 'true');
+      }, 3000); // 3s delay to ensure everything is loaded
+      
+      return () => clearTimeout(timer);
+    }
+  }, [settings.userName]);
+
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
   }, [isSpeaking]);
+
+  useEffect(() => {
+    isHoldToTalkRef.current = isHoldToTalk;
+  }, [isHoldToTalk]);
 
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const synthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
@@ -305,7 +387,7 @@ export default function App() {
   const handleTextInput = (e: React.FormEvent) => {
     e.preventDefault();
     if (inputText.trim()) {
-      handleUserCommand(inputText);
+      handleUserCommand(inputText, undefined, 'text');
       setInputText('');
       setShowInput(false);
     }
@@ -357,52 +439,45 @@ export default function App() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
       const recognition = new SpeechRecognition();
-      recognition.continuous = true; // Make it more powerful by staying active
+      recognition.continuous = true; 
       recognition.interimResults = true;
-      recognition.lang = 'bn-BD'; // Recognition should prioritize native Bengali engine for better accuracy with accents
+      recognition.lang = 'en-US'; 
 
       recognition.onstart = () => {
         setIsListening(true);
+        isActuallyListeningRef.current = true;
+        latestTranscriptRef.current = '';
       };
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
-        const current = event.results[event.resultIndex][0].transcript;
-        setTranscript(current);
-        
-        if (settingsRef.current.autoListen && !wakeTriggeredRef.current) {
-          const interimCheck = checkWakeWord(current, settingsRef.current.autoListenSensitivity || 3);
-          if (interimCheck.detected) {
-            wakeTriggeredRef.current = true;
-            setWakeDetected(true);
-            playWakeSound();
-            setTimeout(() => setWakeDetected(false), 2000);
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript;
+          } else {
+            interimTranscript += event.results[i][0].transcript;
           }
         }
+
+        const current = finalTranscript || interimTranscript;
+        setTranscript(current);
+        latestTranscriptRef.current = current;
         
-        // Use a timeout to detect when user stops speaking for "speed"
-        if (event.results[event.resultIndex].isFinal) {
-          let commandToProcess = current;
+        // If we have a final result, we process it but with a slight delay
+        if (finalTranscript) {
+          let commandToProcess = finalTranscript;
 
-          if (settingsRef.current.autoListen) {
-            const wakeCheck = checkWakeWord(current, settingsRef.current.autoListenSensitivity || 3);
-            if (!wakeCheck.detected) {
-              // Ignore if wake word not found, restart
-              wakeTriggeredRef.current = false;
-              recognition.stop();
-              return;
+          // Debounce the final command processing
+          if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+          typingTimeoutRef.current = setTimeout(() => {
+            // Only auto-submit if not in hold-to-talk mode
+            if (!isHoldToTalkRef.current) {
+               handleUserCommand(commandToProcess, undefined, 'voice');
+               try { recognitionRef.current?.stop(); } catch(e) {}
             }
-            commandToProcess = wakeCheck.command;
-            if (!commandToProcess) {
-              speak("Yes, how can I help?");
-              wakeTriggeredRef.current = false;
-              recognition.stop();
-              return;
-            }
-          }
-
-          wakeTriggeredRef.current = false;
-          handleUserCommand(commandToProcess);
-          recognition.stop();
+          }, 1500); 
         }
       };
 
@@ -410,32 +485,22 @@ export default function App() {
         if (['no-speech', 'aborted', 'audio-capture'].includes(event.error)) {
           console.warn('Speech engine warning:', event.error);
           setIsListening(false);
+          isActuallyListeningRef.current = false;
           return;
         }
         console.error('Recognition error:', event.error);
-        if (!settingsRef.current.autoListen) {
-          setError(`System Alert: ${event.error}`);
-        }
+        setError(`System Alert: ${event.error}`);
         setIsListening(false);
+        isActuallyListeningRef.current = false;
       };
 
       recognition.onend = () => {
         setIsListening(false);
-        if (settingsRef.current.autoListen && !isSpeakingRef.current) {
-          try {
-            recognition.start();
-          } catch (e) {
-            console.error("Auto-listen restart failed:", e);
-          }
-        }
+        isActuallyListeningRef.current = false;
+        setIsHoldToTalk(false);
       };
 
       recognitionRef.current = recognition;
-
-      // Start auto listening if enabled
-      if (settings.autoListen) {
-        try { recognition.start(); } catch(e) {}
-      }
     } else {
       setError('Speech Recognition not supported in this browser.');
     }
@@ -486,17 +551,19 @@ export default function App() {
         if (videoRef.current && streamRef.current) {
           videoRef.current.srcObject = streamRef.current;
         }
-      }, 100);
+      }, 300);
 
     } catch (err: any) {
       console.error("Camera access denied or unavailable", err);
       let msg = "Unable to access the camera.";
-      if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError' || err.message?.includes('found')) {
+      if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError' || (err.message && err.message.toLowerCase().includes('found'))) {
         msg = "No camera device detected. Please connect a camera and try again.";
-      } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        msg = "Camera permission was denied. Please allow access in your browser settings.";
+      } else if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || (err.message && err.message.toLowerCase().includes('denied'))) {
+        msg = "Camera permission denied. If you're in an iframe, try opening the app in a new tab.";
       } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
         msg = "Camera is already in use by another application.";
+      } else if (window.self !== window.top) {
+        msg = "Camera access blocked. Try opening the app in a new tab (iframe restriction).";
       }
       setError(msg);
       setIsCameraActive(false);
@@ -542,13 +609,21 @@ export default function App() {
     }
   }, [activeTab, isCameraActive, stopCamera]);
 
-  const handleUserCommand = async (command: string, imageBase64?: string) => {
+  const handleUserCommand = async (command: string, imageBase64?: string, mode: 'text' | 'voice' = 'text') => {
     if (!command.trim() && !imageBase64) return;
     
     setIsProcessing(true);
     const lowerCommand = (command || '').toLowerCase();
 
-    setHistory(prev => [...prev, { role: 'user', text: command || '[Image Uploaded]', image: imageBase64 || null }]);
+    const userMessage = { role: 'user' as const, text: command || '[Image Uploaded]', image: imageBase64 || null };
+    setHistory(prev => [...prev, userMessage]);
+
+    if (user) {
+      addDoc(collection(db, 'users', user.uid, 'history'), {
+        ...userMessage,
+        createdAt: serverTimestamp()
+      });
+    }
     
     try {
       const geminiHistory = history.map(h => ({
@@ -558,22 +633,58 @@ export default function App() {
 
       const response = await getAssistantResponse(command || 'Take a look at this image.', geminiHistory, imageBase64);
       
-      let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').trim();
-      setHistory(prev => [...prev, { role: 'model', text: cleanResponse }]);
-      speak(cleanResponse);
+      let cleanResponse = response.replace(/\[ACTION:.*?\]/g, '').replace(/```json[\s\S]*?```/g, '').trim();
+      const modelMessage = { role: 'model' as const, text: cleanResponse };
+      setHistory(prev => [...prev, modelMessage]);
 
+      if (user) {
+        addDoc(collection(db, 'users', user.uid, 'history'), {
+          ...modelMessage,
+          createdAt: serverTimestamp()
+        });
+      }
+      
+      // Only speak if user used voice
+      if (mode === 'voice') {
+        speak(cleanResponse);
+      }
+
+      // 1. Handle JSON actions
+      const jsonMatch = response.match(/```json([\s\S]*?)```/);
+      if (jsonMatch) {
+        try {
+          const actions = JSON.parse(jsonMatch[1].trim());
+          if (Array.isArray(actions)) {
+            setExecutingActions(actions);
+            setCurrentExecIndex(0);
+          }
+        } catch (e) {
+          console.error("Failed to parse JSON actions:", e);
+        }
+      }
+
+      // 2. Handle [ACTION:...] tags (legacy support)
       const actionMatch = response.match(/\[ACTION:(.*?)\|(.*?)\]/);
       if (actionMatch) {
-         const [, type, value] = actionMatch;
+          const [, type, value] = actionMatch;
           const taskId = Math.random().toString(36).substr(2, 9);
           const newTask = {
-            id: taskId,
             type: type,
             value: value,
             time: Date.now(),
             createdAt: new Date().toISOString()
           };
-          setTasks(prev => [newTask, ...prev]);
+
+          if (user) {
+            addDoc(collection(db, 'users', user.uid, 'tasks'), newTask);
+          } else {
+            setTasks(prev => [{ id: taskId, ...newTask }, ...prev]);
+          }
+
+          if (type === 'OPEN_APP') {
+            setExecutingActions([{ action: 'OPEN_APP', app_name: value }]);
+            setCurrentExecIndex(0);
+          }
       }
     } catch (err) {
       console.error("AI Error:", err);
@@ -585,7 +696,11 @@ export default function App() {
 
   const speak = (text: string) => {
     if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
+      try {
+        window.speechSynthesis.cancel();
+      } catch (e) {
+        console.warn("Speech cancel failed", e);
+      }
       
       // Pronunciation dictionary for common Bengali-Latin (Banglish) words
       const phoneticsMap: Record<string, string> = {
@@ -614,42 +729,63 @@ export default function App() {
       });
 
       const utterance = new SpeechSynthesisUtterance(enhancedText);
-      const voices = window.speechSynthesis.getVoices();
+      let voices = window.speechSynthesis.getVoices();
       
-      // Prioritize hi-IN and en-IN for better subcontinental Romanized pronunciation
-      const preferredVoice = voices.find(v => v.lang === 'hi-IN' && v.name.includes('Google')) ||
-                            voices.find(v => v.lang.includes('en-IN') && v.name.includes('Google')) || 
-                            voices.find(v => v.lang.includes('hi-IN')) ||
-                            voices.find(v => v.lang.includes('en-IN')) ||
-                            voices.find(v => v.lang === 'en-US' && v.name.includes('Google')) ||
-                            voices.find(v => v.lang.includes('en-GB') || v.lang === 'en-US') ||
-                            voices[0];
-      
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-        utterance.lang = preferredVoice.lang;
+      const selectVoice = () => {
+        // Prioritize hi-IN and en-IN for better subcontinental Romanized pronunciation
+        const preferredVoice = voices.find(v => v.lang === 'hi-IN' && v.name.includes('Google')) ||
+                              voices.find(v => v.lang.includes('en-IN') && v.name.includes('Google')) || 
+                              voices.find(v => v.lang.includes('hi-IN')) ||
+                              voices.find(v => v.lang.includes('en-IN')) ||
+                              voices.find(v => v.lang === 'en-US' && v.name.includes('Google')) ||
+                              voices.find(v => v.lang.includes('en-GB') || v.lang === 'en-US') ||
+                              voices[0];
+        
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+          utterance.lang = preferredVoice.lang;
+        } else {
+          utterance.lang = 'en-US';
+        }
+      };
+
+      if (!voices.length) {
+        // Wait for voices to load if list is empty
+        window.speechSynthesis.onvoiceschanged = () => {
+          voices = window.speechSynthesis.getVoices();
+          selectVoice();
+          startSpeaking();
+          window.speechSynthesis.onvoiceschanged = null;
+        };
       } else {
-        utterance.lang = 'en-US';
-      } 
-      utterance.rate = settingsRef.current.voiceSpeed;
-      utterance.pitch = settingsRef.current.voicePitch;
-      
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => {
-        setIsSpeaking(false);
-        if (settingsRef.current.autoListen) {
-          try { recognitionRef.current?.start(); } catch (e) {}
+        selectVoice();
+        startSpeaking();
+      }
+
+      function startSpeaking() {
+        utterance.rate = settingsRef.current.voiceSpeed;
+        utterance.pitch = settingsRef.current.voicePitch;
+        
+        utterance.onstart = () => setIsSpeaking(true);
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          if (settingsRef.current.autoListen) {
+            try { recognitionRef.current?.start(); } catch (e) {}
+          }
+        };
+        utterance.onerror = (e) => {
+          console.error("Utterance error", e);
+          setIsSpeaking(false);
+        };
+        
+        synthesisRef.current = utterance;
+        try {
+          window.speechSynthesis.speak(utterance);
+        } catch (err) {
+          console.error("Speech submission failed", err);
+          setIsSpeaking(false);
         }
-      };
-      utterance.onerror = () => {
-        setIsSpeaking(false);
-        if (settingsRef.current.autoListen) {
-          try { recognitionRef.current?.start(); } catch (e) {}
-        }
-      };
-      
-      synthesisRef.current = utterance;
-      window.speechSynthesis.speak(utterance);
+      }
     }
   };
 
@@ -657,21 +793,74 @@ export default function App() {
     if ('vibrate' in navigator && settingsRef.current.hapticFeedback) {
       navigator.vibrate(40);
     }
+    
     if (isListening) {
+      // If we have text and manually stop, process it
+      if (transcript.trim()) {
+        handleUserCommand(transcript, undefined, 'voice');
+      }
       recognitionRef.current?.stop();
     } else {
       setError(null);
       setTranscript('');
-      speak(`Hi ${settings.userName}! Ami tomake kivabe help korte pari?`);
+      // Stop ongoing speech before starting listener
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      
       setTimeout(() => {
         try {
-          if (recognitionRef.current) recognitionRef.current.start();
-        } catch (err) {
+          if (recognitionRef.current && !isActuallyListeningRef.current) {
+            recognitionRef.current.start();
+          }
+        } catch (err: any) {
           console.error("Recognition start failed:", err);
           setIsListening(false);
+          if (err.message && err.message.includes('found')) {
+            setError("Neural listener is unavailable. Please refresh or check your microphone.");
+          }
         }
-      }, 700);
+      }, 300);
     }
+  };
+
+  const startHoldToTalk = (e: React.MouseEvent | React.TouchEvent) => {
+    if (settings.autoListen) return; // Don't interfere with auto-listen
+    e.preventDefault();
+    setIsHoldToTalk(true);
+    
+    if ('vibrate' in navigator && settingsRef.current.hapticFeedback) {
+      navigator.vibrate([20, 10, 20]);
+    }
+
+    if (!isActuallyListeningRef.current) {
+      setError(null);
+      setTranscript('');
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      
+      try {
+        recognitionRef.current?.start();
+      } catch (err) {
+        console.error("HTT Start failed:", err);
+      }
+    }
+  };
+
+  const stopHoldToTalk = () => {
+    if (!isHoldToTalk) return;
+    setIsHoldToTalk(false);
+
+    const finalTranscript = latestTranscriptRef.current.trim();
+    if (finalTranscript) {
+      handleUserCommand(finalTranscript, undefined, 'voice');
+    }
+    
+    try {
+      recognitionRef.current?.stop();
+    } catch (err) {
+      console.error("HTT Stop failed:", err);
+    }
+    setTranscript('');
   };
 
   const stopSpeaking = () => {
@@ -862,15 +1051,27 @@ export default function App() {
             </h1>
             <p className="text-[9px] uppercase tracking-[0.3em] opacity-40 font-bold mt-1">Nexus Protocol v4.0</p>
           </motion.div>
-          <button 
-            onClick={() => setActiveTab(activeTab === 'settings' ? 'chat' : 'settings')}
-            className={cn(
-              "p-3 rounded-2xl border border-white/5 hover:bg-white/5 transition-all active:scale-95",
-              activeTab === 'settings' && "bg-white/10 border-white/20"
-            )}
-          >
-            <Settings className={cn("w-5 h-5 transition-transform duration-500", activeTab === 'settings' && "rotate-180")} />
-          </button>
+          <div className="flex gap-2">
+            <button 
+              onClick={() => setActiveTab(activeTab === 'profile' ? 'chat' : 'profile')}
+              className={cn(
+                "p-3 rounded-2xl border border-white/5 hover:bg-white/5 transition-all active:scale-95 relative",
+                activeTab === 'profile' && "bg-white/10 border-white/20"
+              )}
+            >
+              <UserCircle className={cn("w-5 h-5", activeTab === 'profile' && activeText)} />
+              {user && <div className="absolute top-2 right-2 w-2 h-2 rounded-full bg-green-400 border border-black" />}
+            </button>
+            <button 
+              onClick={() => setActiveTab(activeTab === 'settings' ? 'chat' : 'settings')}
+              className={cn(
+                "p-3 rounded-2xl border border-white/5 hover:bg-white/5 transition-all active:scale-95",
+                activeTab === 'settings' && "bg-white/10 border-white/20"
+              )}
+            >
+              <Settings className={cn("w-5 h-5 transition-transform duration-500", activeTab === 'settings' && "rotate-180")} />
+            </button>
+          </div>
         </header>
 
         {/* Dynamic Content */}
@@ -888,7 +1089,7 @@ export default function App() {
                 {/* Navigation & Search */}
                 <div className="flex justify-between items-center mb-6">
                   <div className="flex gap-6">
-                    {['chat', 'tasks'].map((tab) => (
+                    {['chat', 'tasks', 'profile'].map((tab) => (
                       <button 
                         key={tab}
                         onClick={() => setActiveTab(tab as any)}
@@ -919,40 +1120,20 @@ export default function App() {
                   style={{ maskImage: 'linear-gradient(to bottom, transparent 0%, black 5%, black 95%, transparent 100%)' }}
                 >
                   {history.length === 0 && !transcript && (
-                    <div className="flex flex-col items-center justify-center h-full text-center space-y-8 py-10">
-                      <div className="opacity-20 flex flex-col items-center space-y-4">
+                    <div className="flex flex-col items-center justify-center h-full text-center opacity-40">
+                      <div className="relative group">
                         <motion.div
-                          animate={{ rotate: 360 }}
-                          transition={{ repeat: Infinity, duration: 20, ease: "linear" }}
-                        >
-                          <Globe className="w-16 h-16 animate-pulse" />
-                        </motion.div>
-                        <p className="text-xs uppercase tracking-widest leading-relaxed">System Standby<br/>Waiting for Neural Input</p>
-                      </div>
-                      
-                      <div className="grid grid-cols-2 gap-3 max-w-xs mx-auto opacity-70 w-full px-4">
-                        <button 
-                          onClick={() => {
-                            const number = prompt("Enter phone number to call:");
-                            if (number) handleUserCommand(`Call ${number}`);
+                          animate={{ 
+                            scale: [1, 1.2, 1],
+                            opacity: [0.1, 0.3, 0.1] 
                           }}
-                          className="flex flex-col items-center justify-center p-4 bg-white/5 border border-white/10 rounded-2xl hover:bg-white/10 hover:opacity-100 transition-all active:scale-95"
-                        >
-                          <Phone className="w-5 h-5 mb-3" />
-                          <span className="text-[9px] uppercase tracking-widest font-black">Make Call</span>
-                        </button>
-                        <button 
-                          onClick={() => {
-                            const number = prompt("Enter phone number for SMS:");
-                            const message = prompt("Enter message:");
-                            if (number && message) handleUserCommand(`Send SMS to ${number} saying '${message}'`);
-                          }}
-                          className="flex flex-col items-center justify-center p-4 bg-white/5 border border-white/10 rounded-2xl hover:bg-white/10 hover:opacity-100 transition-all active:scale-95"
-                        >
-                          <MessageSquare className="w-5 h-5 mb-3" />
-                          <span className="text-[9px] uppercase tracking-widest font-black">Send SMS</span>
-                        </button>
+                          transition={{ repeat: Infinity, duration: 4, ease: "easeInOut" }}
+                          className={cn("absolute inset-0 blur-3xl rounded-full", activeColor)}
+                        />
+                        <Globe className={cn("w-16 h-16 mb-4 transition-all duration-1000 group-hover:scale-110", activeText)} />
                       </div>
+                      <h3 className="text-[11px] uppercase tracking-[0.5em] font-black opacity-30 mt-6">Aura Neural Interface</h3>
+                      <p className="text-[9px] uppercase tracking-widest font-bold opacity-10 mt-2">Ready for Neural Input</p>
                     </div>
                   )}
 
@@ -1049,8 +1230,13 @@ export default function App() {
                     </button>
                     <h2 className="text-xs uppercase tracking-widest font-black opacity-40">Active Nodes</h2>
                   </div>
-                  <button onClick={() => {
-                    setTasks([]);
+                  <button onClick={async () => {
+                    if (user) {
+                      const tasksSnap = await getDocs(collection(db, 'users', user.uid, 'tasks'));
+                      tasksSnap.forEach(d => deleteDoc(d.ref));
+                    } else {
+                      setTasks([]);
+                    }
                   }} className="text-[10px] opacity-40 hover:opacity-100 hover:text-red-400 flex items-center gap-1 transition-colors">
                     <Trash2 className="w-3 h-3" /> Clear Nodes
                   </button>
@@ -1137,7 +1323,11 @@ export default function App() {
                               setCompletingTasks(prev => new Set([...prev, task.id]));
                               // Delay deletion for animation
                               setTimeout(() => {
-                                setTasks(prev => prev.filter(t => t.id !== task.id));
+                                if (user) {
+                                  deleteDoc(doc(db, 'users', user.uid, 'tasks', task.id));
+                                } else {
+                                  setTasks(prev => prev.filter(t => t.id !== task.id));
+                                }
                                 setCompletingTasks(prev => {
                                   const next = new Set(prev);
                                   next.delete(task.id);
@@ -1179,6 +1369,15 @@ export default function App() {
               </motion.div>
             )}
 
+            {activeTab === 'profile' && (
+              <UserProfile 
+                onClose={() => setActiveTab('settings')}
+                activeColor={activeColor}
+                activeText={activeText}
+                activeBorder={activeBorder}
+              />
+            )}
+
             {activeTab === 'settings' && (
               <motion.div 
                 key="settings"
@@ -1189,12 +1388,14 @@ export default function App() {
                 className="flex flex-col h-full space-y-8 bg-white/5 rounded-3xl border border-white/5 p-6 backdrop-blur-3xl overflow-y-auto"
               >
                 <div className="flex justify-between items-center">
-                  <h2 className={cn("text-xs uppercase tracking-[0.3em] font-black", activeText)}>System Core</h2>
-                  <div className="flex gap-2">
-                    <button onClick={() => setActiveTab('chat')} className="text-[10px] opacity-40 hover:opacity-100 flex items-center gap-1 transition-all">
-                      Exit Core
-                    </button>
-                  </div>
+                  <h2 className={cn("text-xs uppercase tracking-[0.3em] font-black", activeText)}>Settings</h2>
+                  <button 
+                    onClick={() => setActiveTab('chat')} 
+                    className="p-2 rounded-full hover:bg-white/10 text-white/40 hover:text-white transition-all active:scale-90"
+                    title="Exit Settings"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
                 </div>
 
                 <div className="space-y-6">
@@ -1206,10 +1407,10 @@ export default function App() {
                     className="space-y-4"
                   >
                     {isCameraActive ? (
-                      <div className="relative w-full aspect-square max-h-64 sm:max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center">
+                      <div className="relative w-full aspect-square max-h-64 sm:max-h-80 rounded-3xl overflow-hidden bg-black/80 border-2 border-white/10 flex flex-col items-center justify-center shadow-lg shadow-black/50">
                         <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
                         <div className="absolute inset-x-0 bottom-0 p-4 pb-6 flex justify-center items-center gap-8 bg-gradient-to-t from-black/80 to-transparent">
-                          <button onClick={stopCamera} className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95">
+                          <button onClick={stopCamera} className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95 border border-white/5">
                             <X className="w-6 h-6" />
                           </button>
                           <button onClick={capturePhoto} className="p-4 bg-white text-black rounded-full shadow-[0_0_20px_rgba(255,255,255,0.4)] hover:shadow-[0_0_30px_rgba(255,255,255,0.6)] transition-all active:scale-95">
@@ -1227,15 +1428,9 @@ export default function App() {
                               <Activity className="w-8 h-8 opacity-30" />
                             )}
                           </div>
-                          <button 
-                            onClick={startCamera}
-                            className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center rounded-full transition-opacity cursor-pointer"
-                          >
-                            <Camera className="w-6 h-6 text-white" />
-                          </button>
                         </div>
                         <div className="flex-1 w-full space-y-3">
-                          <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Identity Alias</label>
+                          <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Account</label>
                           <input 
                             type="text" 
                             value={settings.userName}
@@ -1348,67 +1543,7 @@ export default function App() {
                     />
                   </motion.div>
 
-                  {/* Auto-Listen Toggle */}
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.5 }}
-                    className="flex items-center justify-between p-4 bg-white/5 border border-white/5 rounded-2xl"
-                  >
-                    <div>
-                      <h3 className="text-xs uppercase tracking-widest font-black opacity-80">Auto-Listen Mode</h3>
-                      <p className="text-[10px] opacity-40 mt-1">Say "Aura" to wake assistant</p>
-                    </div>
-                    <button 
-                      onClick={() => {
-                        const newAutoListen = !settings.autoListen;
-                        setSettings({ ...settings, autoListen: newAutoListen });
-                        if (newAutoListen) {
-                          try { recognitionRef.current?.start(); } catch(e) {}
-                        } else {
-                          try { recognitionRef.current?.stop(); } catch(e) {}
-                        }
-                      }}
-                      className={cn(
-                        "w-12 h-6 rounded-full transition-colors relative",
-                        settings.autoListen ? activeColor : "bg-white/10"
-                      )}
-                    >
-                      <div className={cn(
-                        "w-4 h-4 bg-white rounded-full absolute top-1 transition-all",
-                        settings.autoListen ? "left-7" : "left-1"
-                      )} />
-                    </button>
-                  </motion.div>
-
-                  {/* Auto-Listen Sensitivity Slider */}
-                  {settings.autoListen && (
-                    <motion.div 
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: 'auto' }}
-                      className="space-y-3 p-4 bg-white/5 border border-white/5 rounded-2xl"
-                    >
-                      <div className="flex justify-between items-center">
-                        <label className="text-[10px] uppercase tracking-widest font-black opacity-30">Wake Word Sensitivity</label>
-                        <span className="text-[10px] font-mono opacity-60">Level {settings.autoListenSensitivity || 3}</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="1" 
-                        max="5" 
-                        step="1"
-                        value={settings.autoListenSensitivity || 3}
-                        onChange={(e) => setSettings({ ...settings, autoListenSensitivity: parseInt(e.target.value) })}
-                        className={cn("w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-current", activeText)}
-                      />
-                      <div className="flex justify-between text-[8px] uppercase tracking-widest opacity-30 mt-1">
-                        <span>Strict</span>
-                        <span>Loose</span>
-                      </div>
-                    </motion.div>
-                  )}
-
-                  {/* Haptic Feedback Setting */}
+                      {/* Haptic Feedback Setting */}
                   <div className="flex items-center justify-between p-4 bg-white/5 border border-white/5 rounded-2xl group transition-colors hover:bg-white/10">
                     <div>
                       <h4 className="text-sm font-bold text-white group-hover:text-cyan-400 transition-colors flex items-center gap-2">
@@ -1470,10 +1605,23 @@ export default function App() {
                   {/* Reset Control */}
                   <div className="flex flex-col gap-3">
                     <button 
-                      onClick={() => {
+                      onClick={async () => {
                         if (confirm('Clear entire chat history?')) {
-                          setHistory([]);
-                          setTasks([]);
+                          if (user) {
+                            try {
+                              // Delete from Firestore
+                              const historySnap = await getDocs(collection(db, 'users', user.uid, 'history'));
+                              historySnap.forEach(d => deleteDoc(d.ref));
+                              
+                              const tasksSnap = await getDocs(collection(db, 'users', user.uid, 'tasks'));
+                              tasksSnap.forEach(d => deleteDoc(d.ref));
+                            } catch (e) {
+                              console.error("Failed to clear cloud sync:", e);
+                            }
+                          } else {
+                            setHistory([]);
+                            setTasks([]);
+                          }
                           setActiveTab('chat');
                         }
                       }}
@@ -1488,111 +1636,277 @@ export default function App() {
           </AnimatePresence>
         </div>
 
-        {/* Global Controls */}
-        <div className="fixed bottom-0 left-0 w-full px-4 sm:px-6 pb-6 sm:pb-10 pt-8 sm:pt-12 bg-gradient-to-t from-[#050505] via-[#050505]/95 to-transparent pointer-events-none z-50">
-          <div className="max-w-lg mx-auto flex flex-col items-center gap-4 sm:gap-6 pointer-events-auto">
-            {error && (
-              <motion.div 
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="w-full bg-red-500/10 border border-red-500/20 px-4 py-3 rounded-2xl text-[10px] text-red-400 font-mono tracking-wider flex justify-between items-center"
-              >
-                <span>{error}</span>
-                <button onClick={() => setError(null)} className="opacity-60 hover:opacity-100">DISMISS</button>
-              </motion.div>
-            )}
+        {/* Camera Overlay */}
+        <AnimatePresence>
+          {isCameraActive && activeTab === 'chat' && (
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[90%] max-w-sm aspect-square sm:aspect-video rounded-3xl overflow-hidden bg-black border-2 border-white/10 z-[100] shadow-[0_0_50px_rgba(0,0,0,0.8)]"
+            >
+              <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+              <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-transparent to-transparent pointer-events-none" />
+              <div className="absolute inset-x-0 bottom-0 p-6 flex justify-center items-center gap-8">
+                <button 
+                  onClick={stopCamera} 
+                  className="p-4 bg-white/10 backdrop-blur-md rounded-full text-white/70 hover:text-white hover:bg-white/20 transition-all active:scale-95 border border-white/5"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+                <button 
+                  onClick={capturePhoto} 
+                  className={cn("p-5 rounded-full shadow-2xl transition-all active:scale-95", activeColor, activeShadow)}
+                >
+                  <Camera className="w-8 h-8 text-white" />
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
-            <div className="flex items-center gap-4 sm:gap-8">
-              <button 
-                onClick={stopSpeaking}
-                className={cn(
-                  "p-3 sm:p-4 rounded-full border border-white/5 bg-white/5 transition-all active:scale-90",
-                  isSpeaking ? "opacity-100 translate-y-0" : "opacity-0 translate-y-4 pointer-events-none"
+        {/* Global Controls - Gemini Like Redesign */}
+        <div className="fixed bottom-0 left-0 w-full px-4 pb-4 sm:pb-8 pt-4 bg-gradient-to-t from-black via-black/90 to-transparent pointer-events-none z-[100]">
+          <div className="max-w-xl mx-auto pointer-events-auto">
+            {/* Action/Error Notification Area */}
+            <div className="flex flex-col gap-2 mb-3">
+              <AnimatePresence>
+                {isSpeaking && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="flex justify-center"
+                  >
+                    <button 
+                      onClick={stopSpeaking}
+                      className="px-4 py-2 bg-red-500/10 border border-red-500/20 rounded-full text-[10px] text-red-500 font-black uppercase tracking-widest flex items-center gap-2 hover:bg-red-500/20 transition-all active:scale-95"
+                    >
+                      <VolumeX className="w-3 h-3" /> Stop Speech
+                    </button>
+                  </motion.div>
                 )}
-              >
-                <VolumeX className="w-5 h-5 sm:w-6 sm:h-6 text-red-500" />
-              </button>
+                {error && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 10 }}
+                    className="bg-red-500/10 border border-red-500/20 px-4 py-3 rounded-2xl text-[10px] text-red-400 font-mono tracking-wider flex justify-between items-center backdrop-blur-xl"
+                  >
+                    <span>{error}</span>
+                    <button onClick={() => setError(null)} className="opacity-60 hover:opacity-100">DISMISS</button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
 
-              <button 
-                onClick={toggleListening}
-                className={cn(
-                  "relative p-6 sm:p-8 rounded-full transition-all duration-500 active:scale-90 shadow-2xl",
-                  isListening 
-                    ? cn("bg-red-500/10 ring-4 ring-red-500/20", activeShadow) 
-                    : cn("bg-white/5 backdrop-blur-xl border border-white/10 hover:border-white/30", activeShadow),
-                  wakeDetected && cn("shadow-[0_0_40px_rgba(34,211,238,0.5)] ring-4 ring-cyan-400 bg-cyan-900/40")
+            {/* Main Chat Box Container */}
+            <div className="relative group">
+              {/* Tool Menu Extension */}
+              <AnimatePresence>
+                {showTools && (
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.95 }}
+                    className="absolute bottom-full left-0 mb-4 bg-[#1a1a1c]/95 backdrop-blur-2xl border border-white/10 rounded-2xl p-2 flex flex-col gap-1 min-w-[140px] shadow-2xl z-[110]"
+                  >
+                    <button 
+                      onClick={() => {
+                        startCamera();
+                        setShowTools(false);
+                      }}
+                      className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 rounded-xl transition-all text-white/70 hover:text-white"
+                    >
+                      <Camera className="w-4 h-4 text-cyan-400" />
+                      <span className="text-[10px] font-black uppercase tracking-widest">Camera</span>
+                    </button>
+                    <button 
+                      onClick={() => {
+                        alert("File upload system initiated...");
+                        setShowTools(false);
+                      }}
+                      className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 rounded-xl transition-all text-white/70 hover:text-white"
+                    >
+                      <Paperclip className="w-4 h-4 text-purple-400" />
+                      <span className="text-[10px] font-black uppercase tracking-widest">Post File</span>
+                    </button>
+                    <div className="h-[1px] bg-white/5 my-1" />
+                    <button 
+                      onClick={() => {
+                        setActiveTab('tasks');
+                        setShowTools(false);
+                      }}
+                      className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 rounded-xl transition-all text-white/70 hover:text-white"
+                    >
+                      <Zap className="w-4 h-4 text-yellow-400" />
+                      <span className="text-[10px] font-black uppercase tracking-widest">Tasks</span>
+                    </button>
+                  </motion.div>
                 )}
+              </AnimatePresence>
+
+              {/* Chat Input Bar */}
+              <form 
+                onSubmit={handleTextInput}
+                className="flex items-end gap-2 bg-[#1a1a1c] border border-white/10 rounded-[28px] p-2 pl-3 focus-within:border-white/20 transition-all shadow-lg"
               >
-                {wakeDetected && (
-                  <div className="absolute inset-0 rounded-full animate-ping bg-cyan-400/40 pointer-events-none" />
-                )}
-                {isListening && !wakeDetected && (
-                  <div className="absolute inset-0 rounded-full animate-ping bg-red-500/20 pointer-events-none" />
-                )}
-                <div className={cn("transition-transform duration-500", isListening && "scale-110")}>
-                  {isListening ? (
-                    <MicOff className="w-6 h-6 sm:w-8 sm:h-8 text-red-500" />
-                  ) : (
-                    <Mic className={cn("w-6 h-6 sm:w-8 sm:h-8", activeText)} />
+                <button 
+                  type="button"
+                  onClick={() => setShowTools(!showTools)}
+                  className={cn(
+                    "p-3 rounded-full transition-all active:scale-90 flex items-center justify-center mb-0.5",
+                    showTools ? "bg-white/10 text-white" : "text-white/40 hover:text-white hover:bg-white/5"
                   )}
-                </div>
-              </button>
+                >
+                  <Plus className={cn("w-5 h-5 transition-transform duration-300", showTools && "rotate-45")} />
+                </button>
 
-              <button 
-                onClick={() => setShowInput(!showInput)}
-                className="p-3 sm:p-4 rounded-full border border-white/5 bg-white/5 transition-all text-white/30 hover:text-white active:scale-90"
-              >
-                <MessageSquare className="w-5 h-5 sm:w-6 sm:h-6" />
-              </button>
-
-              <button 
-                onClick={() => {
-                  const input = document.createElement('input');
-                  input.type = 'file';
-                  input.accept = 'image/*';
-                  input.capture = 'environment';
-                  input.onchange = (e) => {
-                    const file = (e.target as HTMLInputElement).files?.[0];
-                    if (file) {
-                      const reader = new FileReader();
-                      reader.onload = (ev) => {
-                        const imgBase64 = ev.target?.result as string;
-                        handleUserCommand('', imgBase64);
-                      };
-                      reader.readAsDataURL(file);
+                <textarea 
+                  rows={1}
+                  value={inputText}
+                  onChange={(e) => {
+                    setInputText(e.target.value);
+                    setIsUserTyping(true);
+                    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+                    typingTimeoutRef.current = setTimeout(() => setIsUserTyping(false), 1500);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleTextInput(e as any);
                     }
-                  };
-                  input.click();
-                }}
-                className="p-3 sm:p-4 rounded-full border border-white/5 bg-white/5 transition-all text-white/30 hover:text-white active:scale-90"
-              >
-                <Camera className="w-5 h-5 sm:w-6 sm:h-6" />
-              </button>
+                  }}
+                  placeholder="Ask Aura..."
+                  className="flex-1 bg-transparent border-none px-2 py-3.5 text-[15px] focus:outline-none placeholder:text-white/20 resize-none min-h-[48px] max-h-32 text-white/90"
+                />
+
+                <div className="flex items-center gap-1 mb-0.5 mr-0.5">
+                  <AnimatePresence mode="wait">
+                    {inputText.trim() ? (
+                      <motion.button
+                        key="send"
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.8 }}
+                        type="submit"
+                        disabled={isProcessing}
+                        className={cn(
+                          "p-3 rounded-full transition-all active:scale-95 disabled:opacity-50",
+                          activeColor, "text-white shadow-lg"
+                        )}
+                      >
+                        <Send className="w-5 h-5" />
+                      </motion.button>
+                    ) : (
+                      <motion.button
+                        key="voice"
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.8 }}
+                        whileTap={{ scale: 0.9 }}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          startHoldToTalk(e);
+                        }}
+                        onMouseUp={(e) => {
+                          e.preventDefault();
+                          stopHoldToTalk();
+                        }}
+                        onMouseLeave={stopHoldToTalk}
+                        onTouchStart={(e) => {
+                          e.preventDefault();
+                          startHoldToTalk(e);
+                        }}
+                        onTouchEnd={(e) => {
+                          e.preventDefault();
+                          stopHoldToTalk();
+                        }}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          if (!isHoldToTalk) toggleListening();
+                        }}
+                        className={cn(
+                          "relative p-5 rounded-full transition-all duration-500 flex items-center justify-center group overflow-hidden shadow-2xl border border-transparent",
+                          isListening 
+                            ? "bg-red-500 scale-125 shadow-red-500/50 rotate-[360deg] border-red-400/50" 
+                            : cn("bg-white/5 hover:bg-white/10 text-white/40 hover:text-white", activeBorder)
+                        )}
+                      >
+                        {/* Dynamic Waveform Rings */}
+                        <AnimatePresence>
+                          {isListening && (
+                            <>
+                              <motion.div 
+                                initial={{ scale: 0.8, opacity: 0.5 }}
+                                animate={{ scale: 3.5, opacity: 0 }}
+                                transition={{ repeat: Infinity, duration: 2, ease: "easeOut" }}
+                                className="absolute inset-0 bg-red-500/30 rounded-full"
+                              />
+                              <motion.div 
+                                initial={{ scale: 0.8, opacity: 0.5 }}
+                                animate={{ scale: 2.5, opacity: 0 }}
+                                transition={{ repeat: Infinity, duration: 2, delay: 0.7, ease: "easeOut" }}
+                                className="absolute inset-0 bg-red-400/20 rounded-full"
+                              />
+                              <motion.div 
+                                initial={{ scale: 1 }}
+                                animate={{ scale: [1, 1.1, 1] }}
+                                transition={{ repeat: Infinity, duration: 0.8 }}
+                                className="absolute inset-0 bg-red-600/10 rounded-full"
+                              />
+                            </>
+                          )}
+                        </AnimatePresence>
+                        
+                        <div className="relative z-10">
+                          {isListening ? (
+                            <div className="flex items-center justify-center">
+                               <MicOff className="w-7 h-7 text-white" />
+                               <motion.div 
+                                 animate={{ opacity: [0.3, 1, 0.3] }}
+                                 transition={{ repeat: Infinity, duration: 1 }}
+                                 className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-white shadow-lg"
+                               />
+                            </div>
+                          ) : (
+                            <Mic className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                          )}
+                        </div>
+
+                        {/* Theme-based reactive glow */}
+                        {!isListening && (
+                          <div className={cn("absolute inset-0 opacity-0 group-hover:opacity-20 transition-opacity blur-2xl rounded-full", activeColor)} />
+                        )}
+                      </motion.button>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </form>
             </div>
             
+            {/* Visual Feedback for Voice */}
             <AnimatePresence>
-              {showInput && (
-                <motion.form 
-                  initial={{ opacity: 0, y: 20 }}
+              {(isListening || transcript) && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: 20 }}
-                  onSubmit={handleTextInput}
-                  className="w-full flex gap-3"
+                  exit={{ opacity: 0, y: 10 }}
+                  className="mt-3 flex flex-col items-center gap-2"
                 >
-                  <input 
-                    type="text" 
-                    value={inputText}
-                    onChange={(e) => {
-                      setInputText(e.target.value);
-                      setIsUserTyping(true);
-                      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-                      typingTimeoutRef.current = setTimeout(() => setIsUserTyping(false), 1500);
-                    }}
-                    placeholder="Input Neural Query..."
-                    className="flex-1 bg-white/5 border border-white/10 rounded-2xl px-5 py-4 text-sm focus:outline-none focus:border-white/30 transition-all placeholder:text-white/20"
-                    autoFocus
-                  />
-                </motion.form>
+                  <div className="flex gap-1 items-center px-4 py-1.5 bg-black/40 border border-white/5 rounded-full">
+                     <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+                     <span className="text-[9px] font-black uppercase tracking-widest text-cyan-400/80">
+                        {isHoldToTalk ? 'Release to Send' : 'Listening...'}
+                     </span>
+                  </div>
+                  {transcript && (
+                    <p className="text-[11px] text-white/40 font-medium italic text-center max-w-xs truncate px-4">
+                       "{transcript}"
+                    </p>
+                  )}
+                </motion.div>
               )}
             </AnimatePresence>
           </div>
